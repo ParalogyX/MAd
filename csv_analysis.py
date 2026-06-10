@@ -14,8 +14,26 @@ from typing import Callable
 import pandas as pd
 
 from investment_adviser import load_symbol_data
+from find_signal import (
+    calculate_atr14,
+    calculate_daily_sl_tp,
+    normalize_ohlcv_columns,
+    smart_round_price,
+)
 
 NUMBER_OF_SIGNALS = 10
+SL_TP_COLUMNS = [
+    "atr_1d",
+    "atr_percent_1d",
+    "usable_atr_1d",
+    "sl_distance",
+    "tp_distance",
+    "stop_loss",
+    "take_profit",
+    "risk_reward_ratio",
+    "sl_tp_reason",
+]
+
 
 def find_best_signals(
     input_path: Path,
@@ -50,17 +68,67 @@ def find_best_signals(
         kind="mergesort",
     ).head(top_n)
 
-    filtered.insert(
-        loc=1,
-        column="current_price",
-        value=[
-            get_current_price(str(ticker), price_loader=price_loader)
-            for ticker in filtered["ticker"]
-        ],
-    )
+    filtered = enrich_with_current_prices(filtered, price_loader=price_loader)
+    filtered = enrich_with_sl_tp(filtered, price_loader=price_loader)
 
     filtered.to_csv(output_path, index=False)
     return filtered
+
+
+def enrich_with_current_prices(
+    signals: pd.DataFrame,
+    price_loader: Callable[..., pd.DataFrame] = load_symbol_data,
+) -> pd.DataFrame:
+    """Ensure selected rows have a current_price column."""
+
+    enriched = signals.copy()
+    if "current_price" not in enriched.columns:
+        enriched.insert(loc=1, column="current_price", value=None)
+
+    for index, row in enriched.iterrows():
+        current_price = _to_float(row.get("current_price"))
+        if current_price is None or current_price <= 0:
+            current_price = get_current_price(
+                str(row["ticker"]),
+                price_loader=price_loader,
+            )
+        enriched.at[index, "current_price"] = current_price
+
+    current_price = enriched.pop("current_price")
+    enriched.insert(loc=1, column="current_price", value=current_price)
+    return enriched
+
+
+def enrich_with_sl_tp(
+    signals: pd.DataFrame,
+    price_loader: Callable[..., pd.DataFrame] = load_symbol_data,
+) -> pd.DataFrame:
+    """Ensure selected rows have ATR-based SL/TP columns."""
+
+    enriched = signals.copy()
+    for column in SL_TP_COLUMNS:
+        if column not in enriched.columns:
+            enriched[column] = None
+
+    for index, row in enriched.iterrows():
+        current_price = _to_float(row.get("current_price"))
+        atr_1d = _to_float(row.get("atr_1d"))
+        if atr_1d is None or atr_1d <= 0:
+            atr_1d = get_daily_atr(
+                str(row["ticker"]),
+                price_loader=price_loader,
+            )
+
+        sl_tp = calculate_daily_sl_tp(
+            current_price=current_price,
+            direction=str(row.get("direction", "")),
+            signal_strength=_to_float(row.get("signal_strength")) or 0.0,
+            atr_1d=atr_1d,
+        )
+        for column, value in sl_tp.items():
+            enriched.at[index, column] = value
+
+    return enriched
 
 
 def get_current_price(
@@ -94,10 +162,37 @@ def get_current_price(
             close_values = pd.to_numeric(data[close_column], errors="coerce").dropna()
             if close_values.empty:
                 continue
-            return round(float(close_values.iloc[-1]), 8)
+            return smart_round_price(float(close_values.iloc[-1]))
         except Exception:
             continue
     return None
+
+
+def get_daily_atr(
+    ticker: str,
+    price_loader: Callable[..., pd.DataFrame] = load_symbol_data,
+) -> float | None:
+    """Return latest ATR14 from recent daily candles, or None on failure."""
+
+    now = datetime.now(timezone.utc)
+    try:
+        data = price_loader(
+            symbol=ticker,
+            timeframe="1d",
+            begin_time=now - timedelta(days=800),
+            end_time=now,
+            provider="fallback",
+        )
+        normalized = normalize_ohlcv_columns(data)
+        if len(normalized) < 14:
+            return None
+        atr = calculate_atr14(normalized)
+        value = pd.to_numeric(atr, errors="coerce").dropna()
+        if value.empty:
+            return None
+        return float(value.iloc[-1])
+    except Exception:
+        return None
 
 
 def default_output_path() -> Path:
@@ -119,7 +214,12 @@ def main() -> None:
         default=None,
         help="Output CSV path. Defaults to best_signals_YYYYMMDD.csv.",
     )
-    parser.add_argument("--top", type=int, default=NUMBER_OF_SIGNALS, help="Number of rows to save.")
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=NUMBER_OF_SIGNALS,
+        help="Number of rows to save.",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -134,6 +234,16 @@ def _find_column(data: pd.DataFrame, wanted: str) -> str | None:
         if str(column).lower() == wanted_normalized:
             return str(column)
     return None
+
+
+def _to_float(value: object) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(numeric):
+        return None
+    return numeric
 
 
 if __name__ == "__main__":

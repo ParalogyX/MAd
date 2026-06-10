@@ -27,6 +27,7 @@ from investment_adviser import (
 STRATEGY_NAME = "Multi-Timeframe Trend Momentum Consensus Signal"
 OUTPUT_COLUMNS = [
     "ticker",
+    "current_price",
     "direction",
     "signal_strength",
     "daily_trend_score",
@@ -41,6 +42,15 @@ OUTPUT_COLUMNS = [
     "final_short_score",
     "reason",
     "timestamp_utc",
+    "atr_1d",
+    "atr_percent_1d",
+    "usable_atr_1d",
+    "sl_distance",
+    "tp_distance",
+    "stop_loss",
+    "take_profit",
+    "risk_reward_ratio",
+    "sl_tp_reason",
 ]
 
 MIN_DAILY_CANDLES = 260
@@ -418,6 +428,117 @@ def calculate_sentiment_scores(sentiment: float) -> tuple[float, float]:
     return (normalized + 100.0) / 2.0, (100.0 - normalized) / 2.0
 
 
+def calculate_daily_sl_tp(
+    current_price: float,
+    direction: str,
+    signal_strength: float,
+    atr_1d: float,
+) -> dict[str, Any]:
+    """Calculate stop-loss and take-profit levels for daily signals.
+
+    This function does not place trades. It only returns calculated levels.
+    Stop-loss distance is volatility-based and is not widened by signal
+    strength; signal strength only slightly adjusts take-profit distance.
+    """
+
+    atr_value = _to_float(atr_1d)
+    price_value = _to_float(current_price)
+    if price_value is None or price_value <= 0:
+        return _empty_sl_tp_result(atr_value, "Invalid current price")
+
+    normalized_direction = str(direction).strip().lower()
+    if normalized_direction not in {"buy", "sell", "neutral"}:
+        return _empty_sl_tp_result(atr_value, "Invalid direction")
+    if normalized_direction == "neutral":
+        return _empty_sl_tp_result(
+            atr_value,
+            "Neutral signal, SL/TP not calculated",
+        )
+
+    strength_value = _to_float(signal_strength)
+    if strength_value is None:
+        strength_value = 0.0
+    strength_value = max(0.0, min(100.0, strength_value))
+
+    if atr_value is None or atr_value <= 0:
+        return _empty_sl_tp_result(atr_value, "Invalid ATR")
+
+    atr_percent_1d = atr_value / price_value
+    min_atr_percent = 0.015
+    max_atr_percent = 0.12
+    usable_atr_percent = min(
+        max(atr_percent_1d, min_atr_percent),
+        max_atr_percent,
+    )
+    usable_atr_1d = price_value * usable_atr_percent
+
+    sl_multiplier = 0.45
+    sl_distance = sl_multiplier * usable_atr_1d
+    tp_multiplier = 0.60 + 0.25 * (strength_value / 100.0)
+    tp_distance = tp_multiplier * usable_atr_1d
+    risk_reward_ratio = tp_distance / sl_distance
+
+    if normalized_direction == "buy":
+        stop_loss = price_value - sl_distance
+        take_profit = price_value + tp_distance
+    else:
+        stop_loss = price_value + sl_distance
+        take_profit = max(price_value - tp_distance, price_value * 0.0001)
+
+    if usable_atr_percent > atr_percent_1d:
+        clamp_note = (
+            f"ATR clamped up from {atr_percent_1d:.2%} "
+            f"to {usable_atr_percent:.2%}"
+        )
+    elif usable_atr_percent < atr_percent_1d:
+        clamp_note = (
+            f"ATR clamped down from {atr_percent_1d:.2%} "
+            f"to {usable_atr_percent:.2%}"
+        )
+    else:
+        clamp_note = "ATR not clamped"
+
+    sl_tp_reason = (
+        "ATR-based daily SL/TP: "
+        f"SL={sl_multiplier:.2f}*ATR, "
+        f"TP={tp_multiplier:.2f}*ATR, "
+        f"{clamp_note}"
+    )
+
+    return {
+        "atr_1d": atr_value,
+        "atr_percent_1d": round(atr_percent_1d, 6),
+        "usable_atr_1d": smart_round_price(usable_atr_1d),
+        "sl_distance": smart_round_price(sl_distance),
+        "tp_distance": smart_round_price(tp_distance),
+        "stop_loss": smart_round_price(stop_loss),
+        "take_profit": smart_round_price(take_profit),
+        "risk_reward_ratio": round(risk_reward_ratio, 3),
+        "sl_tp_reason": sl_tp_reason,
+    }
+
+
+def smart_round_price(price: float) -> float:
+    """Round price by magnitude while preserving low-price precision."""
+
+    abs_price = abs(float(price))
+    if abs_price >= 1000:
+        return round(price, 2)
+    if abs_price >= 100:
+        return round(price, 3)
+    if abs_price >= 10:
+        return round(price, 4)
+    if abs_price >= 1:
+        return round(price, 5)
+    if abs_price >= 0.1:
+        return round(price, 6)
+    if abs_price >= 0.01:
+        return round(price, 7)
+    if abs_price >= 0.001:
+        return round(price, 8)
+    return round(price, 10)
+
+
 def apply_contradiction_penalties(
     final_long_score: float,
     final_short_score: float,
@@ -572,6 +693,13 @@ def process_symbol(
             indicators_4h["adx14"],
         )
         direction, signal_strength = choose_direction(final_long, final_short)
+        current_price = float(data_1h["close"].iloc[-1])
+        sl_tp = calculate_daily_sl_tp(
+            current_price=current_price,
+            direction=direction,
+            signal_strength=signal_strength,
+            atr_1d=indicators_1d["atr14"],
+        )
         reason = build_human_readable_reason(
             direction,
             final_long,
@@ -589,6 +717,7 @@ def process_symbol(
 
         return _result_row(
             ticker=symbol,
+            current_price=current_price,
             direction=direction,
             signal_strength=signal_strength,
             daily_trend_score=max(daily_long, daily_short),
@@ -603,6 +732,7 @@ def process_symbol(
             final_short_score=final_short,
             reason=reason,
             timestamp_utc=timestamp,
+            sl_tp=sl_tp,
         )
     except Exception as exc:
         return _neutral_error_row(symbol, f"ERROR: {exc}", timestamp)
@@ -755,6 +885,42 @@ def run_self_test() -> None:
     assert calculate_adx_score(22) == 60.0
     assert calculate_adx_score(30) == 100.0
 
+    buy_sl_tp = calculate_daily_sl_tp(100.0, "buy", 80.0, 5.0)
+    assert buy_sl_tp["stop_loss"] == 97.75
+    assert buy_sl_tp["take_profit"] == 104.0
+    assert buy_sl_tp["risk_reward_ratio"] > 1.0
+
+    sell_sl_tp = calculate_daily_sl_tp(100.0, "sell", 80.0, 5.0)
+    assert sell_sl_tp["stop_loss"] == 102.25
+    assert sell_sl_tp["take_profit"] == 96.0
+    assert sell_sl_tp["risk_reward_ratio"] > 1.0
+
+    neutral_sl_tp = calculate_daily_sl_tp(100.0, "neutral", 80.0, 5.0)
+    assert neutral_sl_tp["stop_loss"] is None
+    assert neutral_sl_tp["sl_tp_reason"] == "Neutral signal, SL/TP not calculated"
+
+    clipped_strength = calculate_daily_sl_tp(100.0, "buy", 150.0, 5.0)
+    assert clipped_strength["take_profit"] == 104.25
+
+    clamped_up = calculate_daily_sl_tp(100.0, "buy", 50.0, 0.5)
+    assert clamped_up["atr_percent_1d"] == 0.005
+    assert clamped_up["usable_atr_1d"] == 1.5
+    assert "clamped up" in clamped_up["sl_tp_reason"]
+
+    clamped_down = calculate_daily_sl_tp(100.0, "buy", 50.0, 20.0)
+    assert clamped_down["atr_percent_1d"] == 0.2
+    assert clamped_down["usable_atr_1d"] == 12.0
+    assert "clamped down" in clamped_down["sl_tp_reason"]
+
+    low_price_sell = calculate_daily_sl_tp(0.001, "sell", 100.0, 0.01)
+    assert low_price_sell["take_profit"] > 0
+
+    invalid_price = calculate_daily_sl_tp(0.0, "buy", 80.0, 5.0)
+    assert invalid_price["sl_tp_reason"] == "Invalid current price"
+
+    invalid_atr = calculate_daily_sl_tp(100.0, "buy", 80.0, 0.0)
+    assert invalid_atr["sl_tp_reason"] == "Invalid ATR"
+
     def failing_loader(*args: Any, **kwargs: Any) -> pd.DataFrame:
         raise RuntimeError("synthetic loader failure")
 
@@ -766,6 +932,7 @@ def run_self_test() -> None:
     assert row["ticker"] == "FAIL"
     assert row["direction"] == "neutral"
     assert row["signal_strength"] == 0.0
+    assert row["stop_loss"] is None
     assert "synthetic loader failure" in row["reason"]
     print("Self-test passed.")
 
@@ -810,7 +977,7 @@ def _calculate_indicator_values(data: pd.DataFrame) -> dict[str, float]:
     ema200 = close.ewm(span=200, adjust=False).mean()
     rsi14 = _calculate_rsi(close, period=14)
     macd, macd_signal, macd_histogram = _calculate_macd(close)
-    atr14 = _calculate_atr(high, low, close, period=14)
+    atr14 = calculate_atr14(data)
     adx14 = _calculate_adx(high, low, close, period=14)
 
     return {
@@ -848,6 +1015,26 @@ def _calculate_macd(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
     macd_signal = macd.ewm(span=9, adjust=False).mean()
     macd_histogram = macd - macd_signal
     return macd, macd_signal, macd_histogram
+
+
+def calculate_atr14(data: pd.DataFrame) -> pd.Series:
+    """Calculate ATR14 from OHLC data using Wilder-style smoothing.
+
+    The input dataframe must contain normalized open, high, low, and close
+    columns. If a provider includes incomplete current candles, the provider
+    normalization step is expected to remove incomplete OHLC rows first. There
+    is no universal reliable market-close flag across all fallback providers.
+    """
+
+    high = data["high"]
+    low = data["low"]
+    close = data["close"]
+    previous_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - previous_close).abs()
+    tr3 = (low - previous_close).abs()
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return true_range.ewm(alpha=1 / 14, adjust=False).mean()
 
 
 def _calculate_atr(
@@ -929,6 +1116,7 @@ def _extract_indicator_with_aliases(ta_result: Any, indicator_name: str) -> floa
 
 def _result_row(
     ticker: str,
+    current_price: float | None,
     direction: str,
     signal_strength: float,
     daily_trend_score: float,
@@ -943,9 +1131,12 @@ def _result_row(
     final_short_score: float,
     reason: str,
     timestamp_utc: datetime,
+    sl_tp: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    sl_tp_values = sl_tp or _empty_sl_tp_result(None, "SL/TP not calculated")
     return {
         "ticker": ticker,
+        "current_price": smart_round_price(current_price) if current_price else None,
         "direction": direction,
         "signal_strength": round(clip_score(signal_strength), 2),
         "daily_trend_score": round(clip_score(daily_trend_score), 2),
@@ -960,6 +1151,7 @@ def _result_row(
         "final_short_score": round(clip_score(final_short_score), 2),
         "reason": reason,
         "timestamp_utc": timestamp_utc.astimezone(timezone.utc).isoformat(),
+        **sl_tp_values,
     }
 
 
@@ -970,6 +1162,7 @@ def _neutral_error_row(
 ) -> dict[str, Any]:
     return _result_row(
         ticker=ticker,
+        current_price=None,
         direction="neutral",
         signal_strength=0.0,
         daily_trend_score=0.0,
@@ -984,7 +1177,22 @@ def _neutral_error_row(
         final_short_score=0.0,
         reason=reason[:500],
         timestamp_utc=timestamp_utc,
+        sl_tp=_empty_sl_tp_result(None, reason[:500]),
     )
+
+
+def _empty_sl_tp_result(atr_1d: float | None, reason: str) -> dict[str, Any]:
+    return {
+        "atr_1d": atr_1d,
+        "atr_percent_1d": None,
+        "usable_atr_1d": None,
+        "sl_distance": None,
+        "tp_distance": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "risk_reward_ratio": None,
+        "sl_tp_reason": reason,
+    }
 
 
 def clip_score(value: float) -> float:
