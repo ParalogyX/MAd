@@ -36,6 +36,51 @@ pytest
 
 Live internet-dependent behavior is kept outside deterministic tests. Tests use the `mock` provider for market data and mock sentiment sources.
 
+## Docker Deployment
+
+The repository includes a `Dockerfile`, `docker-compose.yml`, and
+`install_server.sh` for Linux server deployment. The container runs
+`trade_signal_generator.py`; generated CSV files are written to a host-mounted
+directory instead of staying inside the container.
+
+On the Linux server, make sure the server has SSH access to GitHub for:
+
+```text
+git@github.com:ParalogyX/MAd.git
+```
+
+Then run the installer script:
+
+```bash
+bash install_server.sh
+```
+
+By default, it clones or updates the repository in `~/MAd`, builds the Docker
+image, starts the `mad-signals` container, and saves CSV files in:
+
+```text
+~/MAd/data
+```
+
+Useful options:
+
+```bash
+APP_DIR=/opt/MAd DATA_DIR=/var/lib/mad-signals bash install_server.sh
+```
+
+Useful commands after deployment:
+
+```bash
+cd ~/MAd
+docker compose logs -f mad-signals
+docker attach mad-signals
+```
+
+In attached console mode, type `now` to run immediately or `stop` to stop the
+scheduler. Detach from the container without stopping it with `Ctrl-p` then
+`Ctrl-q`. If you stop it from the console, start it again with
+`docker compose up -d`.
+
 ## Basic Usage
 
 ```python

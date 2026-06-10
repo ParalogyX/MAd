@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from investment_adviser import (
 )
 
 STRATEGY_NAME = "Multi-Timeframe Trend Momentum Consensus Signal"
+OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
 OUTPUT_COLUMNS = [
     "ticker",
     "current_price",
@@ -846,6 +848,7 @@ def build_human_readable_reason(
 def run_scan(output: Path, sort_output: bool, limit: int | None) -> pd.DataFrame:
     """Scan all discovered tickers and save the signal CSV."""
 
+    output.parent.mkdir(parents=True, exist_ok=True)
     tickers = find_libertex_instruments()
     if limit is not None:
         tickers = tickers[:limit]
@@ -866,6 +869,13 @@ def run_scan(output: Path, sort_output: bool, limit: int | None) -> pd.DataFrame
     result.to_csv(output, index=False)
     print(f"Done. Saved {output}")
     return result
+
+
+def default_output_path() -> Path:
+    """Return the default signals.csv path, honoring M_AD_OUTPUT_DIR."""
+
+    output_dir = Path(os.getenv(OUTPUT_DIR_ENV_VAR, ".")).expanduser()
+    return output_dir / "signals.csv"
 
 
 def run_self_test() -> None:
@@ -941,7 +951,11 @@ def main() -> None:
     """Parse command-line arguments and run the requested action."""
 
     parser = argparse.ArgumentParser(description=STRATEGY_NAME)
-    parser.add_argument("--output", default="signals.csv", help="Output CSV path.")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output CSV path. Defaults to signals.csv or M_AD_OUTPUT_DIR/signals.csv.",
+    )
     parser.add_argument(
         "--sort",
         action="store_true",
@@ -964,7 +978,8 @@ def main() -> None:
         run_self_test()
         return
 
-    run_scan(Path(args.output), sort_output=args.sort, limit=args.limit)
+    output_path = Path(args.output) if args.output else default_output_path()
+    run_scan(output_path, sort_output=args.sort, limit=args.limit)
 
 
 def _calculate_indicator_values(data: pd.DataFrame) -> dict[str, float]:

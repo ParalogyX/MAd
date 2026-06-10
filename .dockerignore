@@ -1,0 +1,15 @@
+.git
+.venv
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.csv
+*.ipynb
+data/
+clear_tickers.txt
+failed_tickers.txt
+tickers.txt
+today_signals_*.csv
+best_signals_*.csv
+signals.csv

@@ -11,16 +11,19 @@ positions, or send orders.
 
 from __future__ import annotations
 
+import os
 import queue
 import subprocess
 import sys
 import threading
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
+OUTPUT_DIR = Path(os.getenv(OUTPUT_DIR_ENV_VAR, str(PROJECT_ROOT))).expanduser()
 SCHEDULED_TIME = time(hour=8, minute=45)
 BEST_SIGNALS_PATTERN = "best_signals_*.csv"
 TRIGGER_COMMAND = "now"
@@ -59,24 +62,35 @@ def next_weekday_run(now: datetime) -> datetime:
 def run_signal_pipeline() -> Path:
     """Run find_signal.py and csv_analysis.py, then create today's CSV."""
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now()
     print("Starting signal generation...", flush=True)
 
     find_signal_script = existing_script_path("find_signals.py", "find_signal.py")
     csv_analysis_script = existing_script_path("csv_analysis.py")
+    signals_path = OUTPUT_DIR / "signals.csv"
+    best_signals_path = OUTPUT_DIR / best_signals_filename()
 
     subprocess.run(
-        [sys.executable, str(find_signal_script)],
+        [sys.executable, str(find_signal_script), "--output", str(signals_path)],
         cwd=PROJECT_ROOT,
         check=True,
     )
     subprocess.run(
-        [sys.executable, str(csv_analysis_script)],
+        [
+            sys.executable,
+            str(csv_analysis_script),
+            "--input",
+            str(signals_path),
+            "--output",
+            str(best_signals_path),
+        ],
         cwd=PROJECT_ROOT,
         check=True,
     )
 
-    best_signals_path = find_latest_best_signals_file(started_at)
+    if not best_signals_path.exists():
+        best_signals_path = find_latest_best_signals_file(started_at)
     output_path = create_today_signals_csv(best_signals_path)
     print(f"Created {output_path.name}", flush=True)
     return output_path
@@ -96,7 +110,7 @@ def find_latest_best_signals_file(started_at: datetime) -> Path:
     """Find the newest best_signals_*.csv created or updated by this run."""
 
     candidates = sorted(
-        PROJECT_ROOT.glob(BEST_SIGNALS_PATTERN),
+        OUTPUT_DIR.glob(BEST_SIGNALS_PATTERN),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -108,6 +122,13 @@ def find_latest_best_signals_file(started_at: datetime) -> Path:
         path for path in candidates if path.stat().st_mtime >= started_timestamp
     ]
     return fresh_candidates[0] if fresh_candidates else candidates[0]
+
+
+def best_signals_filename(now: datetime | None = None) -> str:
+    """Return the dated best-signals filename used by csv_analysis.py."""
+
+    timestamp = now or datetime.now(timezone.utc)
+    return f"best_signals_{timestamp.astimezone(timezone.utc):%Y%m%d}.csv"
 
 
 def create_today_signals_csv(best_signals_path: Path) -> Path:
@@ -156,12 +177,13 @@ def today_output_path(now: datetime) -> Path:
 
     date_part = now.strftime("%d%m%Y")
     time_part = f"{now.hour}-{now.minute:02d}"
-    return PROJECT_ROOT / f"today_signals_{date_part}_{time_part}.csv"
+    return OUTPUT_DIR / f"today_signals_{date_part}_{time_part}.csv"
 
 
 def main() -> None:
     """Run the scheduler loop and listen for console commands."""
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     commands: queue.Queue[str] = queue.Queue()
     listener = threading.Thread(
         target=console_listener,
@@ -177,6 +199,7 @@ def main() -> None:
         flush=True,
     )
     print(f"Type '{EXIT_COMMAND}' to stop.", flush=True)
+    print(f"CSV output directory: {OUTPUT_DIR}", flush=True)
     print(f"Next scheduled run: {next_run}", flush=True)
 
     while True:

@@ -7,6 +7,7 @@ broker login, or order execution.
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -22,6 +23,7 @@ from find_signal import (
 )
 
 NUMBER_OF_SIGNALS = 10
+OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
 SL_TP_COLUMNS = [
     "atr_1d",
     "atr_percent_1d",
@@ -71,6 +73,7 @@ def find_best_signals(
     filtered = enrich_with_current_prices(filtered, price_loader=price_loader)
     filtered = enrich_with_sl_tp(filtered, price_loader=price_loader)
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     filtered.to_csv(output_path, index=False)
     return filtered
 
@@ -199,7 +202,19 @@ def default_output_path() -> Path:
     """Return best_signals_YYYYMMDD.csv for the current UTC date."""
 
     date_text = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return Path(f"best_signals_{date_text}.csv")
+    return default_output_dir() / f"best_signals_{date_text}.csv"
+
+
+def default_input_path() -> Path:
+    """Return signals.csv from M_AD_OUTPUT_DIR or the current directory."""
+
+    return default_output_dir() / "signals.csv"
+
+
+def default_output_dir() -> Path:
+    """Return the configured output directory for generated CSV files."""
+
+    return Path(os.getenv(OUTPUT_DIR_ENV_VAR, ".")).expanduser()
 
 
 def main() -> None:
@@ -208,7 +223,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Find the strongest buy/sell signals from signals.csv.",
     )
-    parser.add_argument("--input", default="signals.csv", help="Input CSV path.")
+    parser.add_argument(
+        "--input",
+        default=None,
+        help="Input CSV path. Defaults to signals.csv or M_AD_OUTPUT_DIR/signals.csv.",
+    )
     parser.add_argument(
         "--output",
         default=None,
@@ -222,7 +241,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    input_path = Path(args.input)
+    input_path = Path(args.input) if args.input else default_input_path()
     output_path = Path(args.output) if args.output else default_output_path()
     result = find_best_signals(input_path, output_path, top_n=args.top)
     print(f"Saved {len(result)} rows to {output_path}")
