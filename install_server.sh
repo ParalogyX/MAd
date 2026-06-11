@@ -122,6 +122,7 @@ main() {
 
     log "Deployment complete"
     printf 'CSV files will be saved on the server in: %s\n' "$DATA_DIR"
+    printf 'MT5 bridge: %s:%s\n' "${MT5_HOST:-192.168.2.125}" "${MT5_PORT:-8001}"
     printf 'View logs with: cd %s && %s logs -f %s\n' \
         "$APP_DIR" "${COMPOSE_CMD[*]}" "$SERVICE_NAME"
     printf 'Attach console with: cd %s && %s attach %s\n' \

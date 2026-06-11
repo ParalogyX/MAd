@@ -19,6 +19,7 @@ from investment_adviser.config import LIBERTEX_PUBLIC_URLS, ProviderSettings
 from investment_adviser.exceptions import DataProviderError
 from investment_adviser.models import MarketDataRequest
 from investment_adviser.providers.base import InstrumentProvider, MarketDataProvider
+from investment_adviser.providers.mt5 import MT5InstrumentProvider
 from investment_adviser.providers.symbols import is_discovery_noise
 from investment_adviser.utils.logging import get_logger
 
@@ -211,6 +212,11 @@ class LibertexMarketDataProvider(MarketDataProvider):
 
 
 def find_libertex_instruments() -> list[str]:
-    """Find all available Libertex instruments as far as public sources allow."""
+    """Find all tradable instruments from the configured MT5 account.
 
-    return LibertexInstrumentProvider().find_instruments()
+    The public function name is kept for backward compatibility with existing
+    notebooks and scripts. Market discovery now uses MT5 as the authoritative
+    source instead of public Libertex pages.
+    """
+
+    return MT5InstrumentProvider().find_instruments()

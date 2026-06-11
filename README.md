@@ -4,8 +4,8 @@
 
 ## What It Does
 
-- Discovers Libertex instruments using best-effort public Libertex pages.
-- Loads normalized OHLCV market data through pluggable providers.
+- Discovers tradable instruments from a configured MetaTrader 5 account.
+- Loads normalized OHLCV market data from MetaTrader 5.
 - Calculates technical indicators such as SMA, EMA, RSI, MACD, Bollinger Bands, ATR, Stochastic, and ADX.
 - Detects deterministic candlestick patterns.
 - Aggregates simple internet/news sentiment into a structured score from `-100` to `+100`.
@@ -14,12 +14,6 @@
 
 ```bash
 pip install -e .
-```
-
-Install optional live yfinance market data support:
-
-```bash
-pip install -e ".[providers]"
 ```
 
 Install test tooling:
@@ -41,7 +35,8 @@ Live internet-dependent behavior is kept outside deterministic tests. Tests use 
 The repository includes a `Dockerfile`, `docker-compose.yml`, and
 `install_server.sh` for Linux server deployment. The container runs
 `trade_signal_generator.py`; generated CSV files are written to a host-mounted
-directory instead of staying inside the container.
+directory instead of staying inside the container. The container connects to
+the MT5 bridge using `MT5_HOST` and `MT5_PORT`.
 
 On the Linux server, make sure the server has SSH access to GitHub for:
 
@@ -66,6 +61,12 @@ Useful options:
 
 ```bash
 APP_DIR=/opt/MAd DATA_DIR=/var/lib/mad-signals bash install_server.sh
+```
+
+Override the MT5 bridge address if needed:
+
+```bash
+MT5_HOST=192.168.2.125 MT5_PORT=8001 bash install_server.sh
 ```
 
 Useful commands after deployment:
@@ -128,11 +129,20 @@ data = load_symbol_data(
 
 ## Data Provider Limitations
 
-Libertex does not appear to publish a stable official public historical market data or trading API for this use case. The Libertex provider therefore only implements instrument discovery as far as practical from public Libertex pages and a documented local snapshot. It deliberately raises `DataProviderError` for Libertex OHLCV data instead of inventing an unofficial broker feed.
+The active market data source is MetaTrader 5 through the `mt5linux` bridge.
+For backward compatibility, public function names such as
+`find_libertex_instruments()` and provider values such as `auto`, `fallback`,
+and `libertex` are still accepted, but they route to MT5 internally.
 
-The default `auto` market data flow tries Libertex first and then the real fallback provider chain. The fallback chain tries yfinance symbol aliases, Binance public crypto klines, and Stooq daily CSV data. The deterministic `mock` provider is only for tests and local development.
+The MT5 bridge must be reachable from the machine or Docker container running
+the library. By default, the project uses:
 
-Not every Libertex CFD symbol has an exact public-market equivalent. For example, some broker-only CFDs, delisted stocks, very new meme coins, or regional instruments may still fail. The library raises `DataProviderError` for those cases instead of returning invented data.
+```text
+MT5_HOST=192.168.2.125
+MT5_PORT=8001
+```
+
+The deterministic `mock` provider remains available for tests only.
 
 ## Sentiment Limitations
 

@@ -8,6 +8,8 @@ services:
     environment:
       TZ: ${TZ:-Europe/Amsterdam}
       M_AD_OUTPUT_DIR: /data
+      MT5_HOST: ${MT5_HOST:-192.168.2.125}
+      MT5_PORT: ${MT5_PORT:-8001}
     volumes:
       - ${M_AD_DATA_DIR:-./data}:/data
     stdin_open: true

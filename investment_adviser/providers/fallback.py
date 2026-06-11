@@ -1,4 +1,4 @@
-"""Fallback market data providers and the public OHLCV loading function."""
+"""Market data providers and the public OHLCV loading function."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from investment_adviser.config import (
 from investment_adviser.exceptions import DataProviderError, ValidationError
 from investment_adviser.models import MarketDataRequest, SentimentDocument
 from investment_adviser.providers.base import MarketDataProvider, SentimentSourceProvider
-from investment_adviser.providers.libertex import LibertexMarketDataProvider
+from investment_adviser.providers.mt5 import MT5MarketDataProvider
 from investment_adviser.providers.symbols import (
     candidate_binance_symbols,
     candidate_stooq_symbols,
@@ -383,12 +383,12 @@ class MockSentimentSourceProvider(SentimentSourceProvider):
         return documents
 
 
+_MT5_PROVIDER = MT5MarketDataProvider()
+
 _MARKET_DATA_PROVIDERS: dict[str, MarketDataProvider] = {
-    "libertex": LibertexMarketDataProvider(),
-    "fallback": CompositeMarketDataProvider(),
-    "yfinance": YFinanceMarketDataProvider(),
-    "binance": BinanceMarketDataProvider(),
-    "stooq": StooqMarketDataProvider(),
+    "mt5": _MT5_PROVIDER,
+    "libertex": _MT5_PROVIDER,
+    "fallback": _MT5_PROVIDER,
     "mock": DeterministicMarketDataProvider(),
 }
 
@@ -416,8 +416,7 @@ def load_symbol_data(
             1h, 4h, and 1d.
         begin_time: Start datetime. Naive datetimes are interpreted as UTC.
         end_time: End datetime. Naive datetimes are interpreted as UTC.
-        provider: Data provider name: auto, libertex, fallback, yfinance,
-            binance, stooq, or mock.
+        provider: Data provider name: auto, mt5, libertex, fallback, or mock.
 
     Returns:
         A DataFrame containing timestamp, open, high, low, close, and volume.
@@ -441,7 +440,7 @@ def load_symbol_data(
     if provider_name == "auto":
         return _load_with_first_successful_provider(
             request,
-            provider_names=("libertex", "fallback"),
+            provider_names=("mt5",),
         )
 
     if provider_name not in _MARKET_DATA_PROVIDERS:

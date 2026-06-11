@@ -38,6 +38,30 @@ STOOQ_INTERVALS: dict[str, str] = {
     "1d": "d",
 }
 
+MT5_DEFAULT_HOST = "192.168.2.125"
+MT5_DEFAULT_PORT = 8001
+MT5_DEFAULT_MAX_BARS = 20_000
+
+MT5_TIMEFRAME_ATTRIBUTES: dict[str, str] = {
+    "1m": "TIMEFRAME_M1",
+    "5m": "TIMEFRAME_M5",
+    "15m": "TIMEFRAME_M15",
+    "30m": "TIMEFRAME_M30",
+    "1h": "TIMEFRAME_H1",
+    "4h": "TIMEFRAME_H4",
+    "1d": "TIMEFRAME_D1",
+}
+
+MT5_TIMEFRAME_SECONDS: dict[str, int] = {
+    "1m": 60,
+    "5m": 5 * 60,
+    "15m": 15 * 60,
+    "30m": 30 * 60,
+    "1h": 60 * 60,
+    "4h": 4 * 60 * 60,
+    "1d": 24 * 60 * 60,
+}
+
 LIBERTEX_PUBLIC_URLS: tuple[str, ...] = (
     "https://libertex.com/",
     "https://libertex.com/shares",
