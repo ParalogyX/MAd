@@ -112,9 +112,16 @@ class MT5InstrumentProvider(MT5BaseProvider, InstrumentProvider):
             if not name or not _is_tradable(symbol_info):
                 continue
             metadata = _symbol_info_to_dict(symbol_info)
+            if hasattr(client, "symbol_select"):
+                try:
+                    client.symbol_select(name, True)
+                except Exception:
+                    pass
             if hasattr(client, "symbol_info"):
                 try:
-                    metadata.update(_symbol_info_to_dict(client.symbol_info(name)))
+                    selected_info = client.symbol_info(name)
+                    if selected_info is not None:
+                        metadata.update(_symbol_info_to_dict(selected_info))
                 except Exception:
                     pass
             metadata["name"] = name

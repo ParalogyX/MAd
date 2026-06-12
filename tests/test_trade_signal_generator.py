@@ -8,10 +8,15 @@ from trade_signal_generator import (
     DEFAULT_SESSION_RULES,
     SESSION_RULES_FILE,
     analyze_group_tickers,
+    build_ticker_trading_times,
     build_trade_plan_rows,
     classify_ticker,
+    classify_ticker_from_metadata,
+    convert_exchange_session_to_local,
     due_session_events,
     is_entry_price_still_valid,
+    load_classification_overrides,
+    load_mt5_symbol_sessions,
     load_session_rules,
     parse_trading_days,
 )
@@ -57,6 +62,126 @@ def test_ticker_classification():
         "Germany DAX index",
         {"start_trade_time": "09:00", "end_trade_time": "17:30"},
     ) == ("europe_stock", "europe_stock_index")
+
+
+def test_extended_ticker_classification_examples():
+    examples = [
+        ("Adobe", "Adobe Systems Inc.", {}, ("us_stock", "us_stock_index")),
+        ("nVidia", "nVidia Corp.", {}, ("us_stock", "us_stock_index")),
+        ("Amazon", "Amazon.com Inc.", {}, ("us_stock", "us_stock_index")),
+        ("SPY", "SPDR S&P 500 Trust ETF", {}, ("us_etf", "us_stock_index")),
+        ("Adidas", "Adidas AG", {}, ("europe_stock", "europe_stock_index")),
+        ("Airbus", "Airbus SE", {}, ("europe_stock", "europe_stock_index")),
+        ("SAP", "SAP SE", {}, ("europe_stock", "europe_stock_index")),
+        ("Siemens", "Siemens AG", {}, ("europe_stock", "europe_stock_index")),
+        ("FTI", "Netherlands 25 (AEX)", {}, ("europe_index", "europe_stock_index")),
+        ("NQCash", "US NDAQ 100", {}, ("us_index", "us_stock_index")),
+        ("YM", "US DJ 30", {}, ("us_index", "us_stock_index")),
+        ("NGASCash", "Natural Gas Cash", {}, ("commodity", "commodity_us")),
+        ("COCOA", "Cocoa Cash", {}, ("commodity", "commodity_us")),
+        ("WHEAT", "Wheat Cash", {}, ("commodity", "commodity_us")),
+        ("EURUSD", "Euro vs US dollar", {}, ("forex", "forex_major")),
+        ("USDCLP", "US Dollar vs Chile Peso", {}, ("forex", "forex_exotic")),
+        ("BTCUSD", "Bitcoin vs US Dollar", {}, ("crypto", "crypto_24_7")),
+        ("XVGUSD", "Verge crypto", {}, ("crypto", "crypto_24_7")),
+        ("HSI", "China 50 (HSI) Cash", {}, ("asia_index", "asia_index")),
+        ("NIY", "Japan 225 (Nikkei)", {}, ("asia_index", "asia_index")),
+    ]
+
+    for symbol, description, metadata, expected in examples:
+        ticker_type, session_group, reason = classify_ticker_from_metadata(
+            symbol,
+            description,
+            metadata,
+        )
+        assert (ticker_type, session_group) == expected
+        assert reason
+
+
+def test_manual_override_beats_automatic_classification(tmp_path):
+    override_path = tmp_path / "ticker_classification_overrides.csv"
+    override_path.write_text(
+        "ticker,ticker_type,session_group,start_trade_time,end_trade_time,"
+        "trading_days,description_override,reason\n"
+        "Adobe,europe_stock,europe_stock_index,09:00,17:30,mon-fri,"
+        "Adobe override,Manual test override\n",
+        encoding="utf-8",
+    )
+    overrides = load_classification_overrides(override_path)
+    data = build_ticker_trading_times(
+        [{"name": "Adobe", "description": "Adobe Systems Inc."}],
+        overrides=overrides,
+        timestamp_utc=datetime(2026, 6, 12, tzinfo=ZoneInfo("UTC")),
+    )
+
+    row = data.iloc[0]
+    assert row["ticker_type"] == "europe_stock"
+    assert row["session_group"] == "europe_stock_index"
+    assert row["classification_source"] == "manual_override"
+    assert row["description"] == "Adobe override"
+
+
+def test_invalid_or_missing_metadata_does_not_crash():
+    data = build_ticker_trading_times(
+        [{"name": "MysteryInstrument"}],
+        timestamp_utc=datetime(2026, 6, 12, tzinfo=ZoneInfo("UTC")),
+    )
+
+    assert len(data) == 1
+    assert data.iloc[0]["ticker_type"] == "unknown"
+    assert data.iloc[0]["classification_reason"]
+
+
+def test_mt5_session_csv_is_used(tmp_path):
+    session_path = tmp_path / "mt5_symbol_sessions.csv"
+    session_path.write_text(
+        "symbol,day_of_week,session_index,from_seconds,to_seconds,from_time,to_time\n"
+        "EURUSD,MONDAY,0,300,86100,00:05,23:55\n"
+        "EURUSD,TUESDAY,0,300,86100,00:05,23:55\n"
+        "EURUSD,WEDNESDAY,0,300,86100,00:05,23:55\n"
+        "EURUSD,THURSDAY,0,300,86100,00:05,23:55\n"
+        "EURUSD,FRIDAY,0,300,86100,00:05,23:55\n",
+        encoding="utf-8",
+    )
+    session_map = load_mt5_symbol_sessions(session_path)
+    data = build_ticker_trading_times(
+        [{"name": "EURUSD", "description": "Euro vs US dollar"}],
+        session_map=session_map,
+        timestamp_utc=datetime(2026, 6, 12, tzinfo=ZoneInfo("UTC")),
+    )
+    row = data.iloc[0]
+
+    assert row["start_trade_time"] == "00:05"
+    assert row["end_trade_time"] == "23:55"
+    assert row["trading_days"] == "mon-fri"
+    assert row["classification_source"] == "mt5_sessions"
+    assert "mon" in row["raw_sessions"]
+
+
+def test_timezone_conversion():
+    day = datetime(2026, 6, 12).date()
+
+    assert convert_exchange_session_to_local(
+        "09:30",
+        "16:00",
+        "America/New_York",
+        "Europe/Amsterdam",
+        day,
+    ) == ("15:30", "22:00")
+    assert convert_exchange_session_to_local(
+        "09:00",
+        "17:30",
+        "Europe/Amsterdam",
+        "Europe/Amsterdam",
+        day,
+    ) == ("09:00", "17:30")
+    assert convert_exchange_session_to_local(
+        "08:00",
+        "16:30",
+        "Europe/London",
+        "Europe/Amsterdam",
+        day,
+    ) == ("09:00", "17:30")
 
 
 def test_scheduler_due_events_rules():

@@ -29,12 +29,15 @@ from find_signal import (
     smart_round_price,
 )
 from investment_adviser.providers.mt5 import MT5InstrumentProvider
+import ticker_classification_rules as classification_rules
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
 OUTPUT_DIR = Path(os.getenv(OUTPUT_DIR_ENV_VAR, str(PROJECT_ROOT))).expanduser()
 SESSION_RULES_FILE = "session_rules.json"
 TICKER_TRADING_TIMES_FILE = "ticker_trading_times.csv"
+MT5_SYMBOL_SESSIONS_FILE = "mt5_symbol_sessions.csv"
+CLASSIFICATION_OVERRIDES_FILE = "ticker_classification_overrides.csv"
 TRIGGER_COMMAND = "now"
 UPDATE_COMMAND = "update"
 RELOAD_COMMAND = "reload"
@@ -51,6 +54,15 @@ METADATA_COLUMNS = [
     "trading_days",
     "ticker_type",
     "session_group",
+    "classification_source",
+    "classification_reason",
+    "exchange",
+    "country",
+    "category",
+    "path",
+    "currency_base",
+    "currency_profit",
+    "raw_sessions",
     "last_updated_utc",
 ]
 TRADE_PLAN_COLUMNS = [
@@ -142,6 +154,26 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "tp_base_multiplier": 0.50,
             "tp_strength_multiplier": 0.20,
         },
+        "asia_index": {
+            "enabled": False,
+            "analysis_time": "01:30",
+            "open_time": "02:15",
+            "close_time": "08:30",
+            "trading_days": "mon-fri",
+            "sl_multiplier": 0.40,
+            "tp_base_multiplier": 0.50,
+            "tp_strength_multiplier": 0.20,
+        },
+        "israel_index": {
+            "enabled": False,
+            "analysis_time": "08:30",
+            "open_time": "09:00",
+            "close_time": "16:00",
+            "trading_days": "sun-thu",
+            "sl_multiplier": 0.40,
+            "tp_base_multiplier": 0.50,
+            "tp_strength_multiplier": 0.20,
+        },
         "unknown": {
             "enabled": False,
             "analysis_time": "08:45",
@@ -164,99 +196,15 @@ DAY_TO_INDEX = {
     "sat": 5,
     "sun": 6,
 }
-FOREX_MAJOR_SYMBOLS = {
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "USDCHF",
-    "USDCAD",
-    "AUDUSD",
-    "NZDUSD",
-}
-FIAT_CODES = {
-    "AUD",
-    "CAD",
-    "CHF",
-    "CNH",
-    "EUR",
-    "GBP",
-    "HKD",
-    "JPY",
-    "MXN",
-    "NOK",
-    "NZD",
-    "PLN",
-    "SEK",
-    "SGD",
-    "TRY",
-    "USD",
-    "ZAR",
-}
-CRYPTO_TOKENS = {
-    "ADA",
-    "AVAX",
-    "BNB",
-    "BTC",
-    "DOGE",
-    "DOT",
-    "ETH",
-    "LINK",
-    "LTC",
-    "MATIC",
-    "SHIB",
-    "SOL",
-    "TRX",
-    "XLM",
-    "XRP",
-}
-COMMODITY_HINTS = {
-    "BRENT",
-    "COPPER",
-    "GOLD",
-    "NATGAS",
-    "OIL",
-    "SILVER",
-    "WTI",
-    "XAG",
-    "XAU",
-}
-US_HINTS = {
-    "AAPL",
-    "AMZN",
-    "DJI",
-    "META",
-    "NASDAQ",
-    "NAS100",
-    "NDX",
-    "NFLX",
-    "NVDA",
-    "NYSE",
-    "SPX",
-    "TSLA",
-    "US100",
-    "US30",
-    "US500",
-}
-EUROPE_HINTS = {
-    "CAC",
-    "DAX",
-    "DE40",
-    "EU50",
-    "EURONEXT",
-    "FRA40",
-    "FTSE",
-    "GER40",
-    "IBEX",
-    "STOXX",
-    "UK100",
-}
 GROUP_DEFAULT_WINDOWS = {
-    "crypto_24_7": ("", "", "mon-sun"),
-    "forex_major": ("", "", "mon-fri"),
-    "forex_exotic": ("", "", "mon-fri"),
+    "crypto_24_7": ("00:00", "23:59", "mon-sun"),
+    "forex_major": ("00:05", "23:55", "mon-fri"),
+    "forex_exotic": ("00:05", "23:55", "mon-fri"),
     "europe_stock_index": ("09:00", "17:30", "mon-fri"),
     "us_stock_index": ("15:30", "22:00", "mon-fri"),
     "commodity_us": ("15:00", "21:45", "mon-fri"),
+    "asia_index": ("02:15", "08:30", "mon-fri"),
+    "israel_index": ("09:00", "16:00", "sun-thu"),
     "unknown": ("", "", "unknown"),
 }
 
@@ -284,6 +232,18 @@ def ticker_trading_times_path() -> Path:
     return OUTPUT_DIR / TICKER_TRADING_TIMES_FILE
 
 
+def mt5_symbol_sessions_path() -> Path:
+    """Return the optional MT5 symbol sessions CSV path."""
+
+    return OUTPUT_DIR / MT5_SYMBOL_SESSIONS_FILE
+
+
+def classification_overrides_path() -> Path:
+    """Return the optional manual classification override CSV path."""
+
+    return OUTPUT_DIR / CLASSIFICATION_OVERRIDES_FILE
+
+
 def ensure_session_rules_file(path: Path | None = None) -> Path:
     """Create session_rules.json with defaults when it is missing."""
 
@@ -292,6 +252,21 @@ def ensure_session_rules_file(path: Path | None = None) -> Path:
     if not rules_path.exists():
         rules_path.write_text(
             json.dumps(DEFAULT_SESSION_RULES, indent=2),
+            encoding="utf-8",
+        )
+        return rules_path
+
+    try:
+        existing_rules = json.loads(rules_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return rules_path
+
+    merged_rules = merge_session_rules(existing_rules)
+    existing_groups = set(existing_rules.get("session_groups", {}))
+    default_groups = set(DEFAULT_SESSION_RULES["session_groups"])
+    if default_groups - existing_groups:
+        rules_path.write_text(
+            json.dumps(merged_rules, indent=2),
             encoding="utf-8",
         )
     return rules_path
@@ -400,16 +375,24 @@ def is_trading_day(trading_days: str, local_day: date) -> bool:
     return local_day.weekday() in allowed_days
 
 
-def update_ticker_trading_times() -> pd.DataFrame:
+def update_ticker_trading_times(debug_symbol: str | None = None) -> pd.DataFrame:
     """Discover MT5 instruments, classify sessions, save CSV, and return it."""
 
     print("Updating ticker trading metadata from MT5...", flush=True)
     print("Connecting to MT5 and requesting symbol metadata...", flush=True)
     provider = MT5InstrumentProvider()
     metadata_rows = provider.find_instrument_metadata()
+    if debug_symbol:
+        print_debug_symbol_metadata(metadata_rows, debug_symbol)
     print(f"Received metadata for {len(metadata_rows)} tradable MT5 symbols.", flush=True)
     print("Classifying tickers into session groups...", flush=True)
-    data = build_ticker_trading_times(metadata_rows)
+    session_map = load_mt5_symbol_sessions()
+    overrides = load_classification_overrides()
+    data = build_ticker_trading_times(
+        metadata_rows,
+        session_map=session_map,
+        overrides=overrides,
+    )
     output_path = ticker_trading_times_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     data.to_csv(output_path, index=False)
@@ -421,11 +404,15 @@ def update_ticker_trading_times() -> pd.DataFrame:
 
 def build_ticker_trading_times(
     metadata_rows: list[dict[str, Any]],
+    session_map: dict[str, dict[str, list[list[str]]]] | None = None,
+    overrides: dict[str, dict[str, str]] | None = None,
     timestamp_utc: datetime | None = None,
 ) -> pd.DataFrame:
     """Build ticker trading metadata from provider metadata rows."""
 
     updated_at = timestamp_utc or datetime.now(timezone.utc)
+    session_map = session_map or {}
+    overrides = overrides or {}
     output_rows: list[dict[str, Any]] = []
     for metadata in metadata_rows:
         symbol = str(metadata.get("name") or metadata.get("ticker") or "").strip()
@@ -437,21 +424,58 @@ def build_ticker_trading_times(
             or metadata.get("category")
             or ""
         ).strip()
-        start_time, end_time, trading_days = detect_trading_window(metadata)
-        classified_metadata = {
+        raw_sessions = session_map.get(_symbol_key(symbol), {})
+        start_time, end_time, trading_days, session_source = detect_trading_window(
+            metadata,
+            raw_sessions,
+        )
+        classifier_metadata = {
             **metadata,
             "start_trade_time": start_time,
             "end_trade_time": end_time,
+            "raw_sessions": raw_sessions,
         }
-        ticker_type, session_group = classify_ticker(
+        ticker_type, session_group, classification_reason = classify_ticker_from_metadata(
             symbol,
             description,
-            classified_metadata,
+            classifier_metadata,
         )
-        if not start_time and not end_time:
-            start_time, end_time, trading_days = GROUP_DEFAULT_WINDOWS.get(
-                session_group,
-                GROUP_DEFAULT_WINDOWS["unknown"],
+        classification_source = (
+            "mt5_metadata" if classification_reason.startswith("MT5") else "heuristic"
+        )
+        if ticker_type == "unknown" and session_group == "unknown":
+            classification_source = "unknown"
+
+        if not start_time and not end_time and session_group != "unknown":
+            start_time, end_time, trading_days = default_window_for_classification(
+                symbol=symbol,
+                ticker_type=ticker_type,
+                session_group=session_group,
+                metadata=metadata,
+                local_day=updated_at.astimezone(ZoneInfo(DEFAULT_TIMEZONE)).date(),
+            )
+        elif session_source == "mt5_sessions":
+            classification_source = "mt5_sessions"
+
+        override = overrides.get(_symbol_key(symbol))
+        if override:
+            ticker_type = override.get("ticker_type") or ticker_type
+            session_group = override.get("session_group") or session_group
+            start_time = override.get("start_trade_time") or start_time
+            end_time = override.get("end_trade_time") or end_time
+            trading_days = override.get("trading_days") or trading_days
+            description = override.get("description_override") or description
+            classification_source = "manual_override"
+            override_reason = override.get("reason") or "Manual override"
+            classification_reason = override_reason
+
+        if not start_time and not end_time and session_group != "unknown":
+            start_time, end_time, trading_days = default_window_for_classification(
+                symbol=symbol,
+                ticker_type=ticker_type,
+                session_group=session_group,
+                metadata=metadata,
+                local_day=updated_at.astimezone(ZoneInfo(DEFAULT_TIMEZONE)).date(),
             )
 
         output_rows.append(
@@ -463,6 +487,15 @@ def build_ticker_trading_times(
                 "trading_days": trading_days,
                 "ticker_type": ticker_type,
                 "session_group": session_group,
+                "classification_source": classification_source,
+                "classification_reason": classification_reason,
+                "exchange": _safe_text(metadata.get("exchange")),
+                "country": _safe_text(metadata.get("country")),
+                "category": _safe_text(metadata.get("category")),
+                "path": _safe_text(metadata.get("path")),
+                "currency_base": _safe_text(metadata.get("currency_base")),
+                "currency_profit": _safe_text(metadata.get("currency_profit")),
+                "raw_sessions": json.dumps(raw_sessions, sort_keys=True),
                 "last_updated_utc": updated_at.astimezone(timezone.utc).isoformat(),
             }
         )
@@ -477,8 +510,210 @@ def build_ticker_trading_times(
     )
 
 
-def detect_trading_window(metadata: dict[str, Any]) -> tuple[str, str, str]:
-    """Return best-effort start/end/trading-days from metadata if available."""
+def load_mt5_symbol_sessions(
+    path: Path | None = None,
+) -> dict[str, dict[str, list[list[str]]]]:
+    """Read optional mt5_symbol_sessions.csv dumped by the MQL5 helper."""
+
+    sessions_path = path or mt5_symbol_sessions_path()
+    if not sessions_path.exists():
+        return {}
+    try:
+        sessions = pd.read_csv(sessions_path)
+    except Exception as exc:
+        print(f"WARNING: could not read {sessions_path.name}: {exc}", flush=True)
+        return {}
+    required = {"symbol", "day_of_week", "from_time", "to_time"}
+    if not required <= set(sessions.columns):
+        print(
+            f"WARNING: {sessions_path.name} is missing required columns: "
+            f"{', '.join(sorted(required - set(sessions.columns)))}",
+            flush=True,
+        )
+        return {}
+
+    result: dict[str, dict[str, list[list[str]]]] = {}
+    for _, row in sessions.iterrows():
+        symbol = _symbol_key(str(row.get("symbol", "")))
+        day = normalize_day_name(str(row.get("day_of_week", "")))
+        start = _normalize_hhmm(row.get("from_time"))
+        end = _normalize_hhmm(row.get("to_time"))
+        if not symbol or not day or not start or not end:
+            continue
+        result.setdefault(symbol, {}).setdefault(day, []).append([start, end])
+    return result
+
+
+def load_classification_overrides(
+    path: Path | None = None,
+) -> dict[str, dict[str, str]]:
+    """Read optional manual classification overrides."""
+
+    override_path = path or classification_overrides_path()
+    if not override_path.exists():
+        return {}
+    try:
+        overrides = pd.read_csv(override_path).fillna("")
+    except Exception as exc:
+        print(f"WARNING: could not read {override_path.name}: {exc}", flush=True)
+        return {}
+
+    result: dict[str, dict[str, str]] = {}
+    for _, row in overrides.iterrows():
+        ticker = _symbol_key(str(row.get("ticker", "")))
+        if not ticker:
+            continue
+        result[ticker] = {
+            "ticker_type": str(row.get("ticker_type", "")).strip(),
+            "session_group": str(row.get("session_group", "")).strip(),
+            "start_trade_time": _normalize_hhmm(row.get("start_trade_time")),
+            "end_trade_time": _normalize_hhmm(row.get("end_trade_time")),
+            "trading_days": str(row.get("trading_days", "")).strip(),
+            "description_override": str(row.get("description_override", "")).strip(),
+            "reason": str(row.get("reason", "")).strip(),
+        }
+    return result
+
+
+def print_debug_symbol_metadata(
+    metadata_rows: list[dict[str, Any]],
+    debug_symbol: str,
+) -> None:
+    """Print the full MT5 metadata dictionary for one selected symbol."""
+
+    wanted = _symbol_key(debug_symbol)
+    for metadata in metadata_rows:
+        symbol = str(metadata.get("name") or metadata.get("ticker") or "")
+        if _symbol_key(symbol) == wanted:
+            print(
+                f"Debug metadata for {symbol}:",
+                json.dumps(metadata, indent=2, sort_keys=True, default=str),
+                sep="\n",
+                flush=True,
+            )
+            return
+    print(f"Debug symbol {debug_symbol!r} was not found in MT5 metadata.", flush=True)
+
+
+def summarize_raw_sessions(
+    raw_sessions: dict[str, list[list[str]]],
+) -> tuple[str, str, str]:
+    """Summarize detailed sessions into simple start/end/day columns."""
+
+    days = [day for day in DAY_TO_INDEX if raw_sessions.get(day)]
+    if not days:
+        return "", "", "unknown"
+    starts: list[str] = []
+    ends: list[str] = []
+    for day in days:
+        for start, end in raw_sessions[day]:
+            starts.append(start)
+            ends.append(end)
+    if not starts or not ends:
+        return "", "", "unknown"
+    return min(starts), max(ends), compress_trading_days(days)
+
+
+def compress_trading_days(days: list[str]) -> str:
+    """Compress day names into mon-fri style where possible."""
+
+    indexes = sorted({DAY_TO_INDEX[day] for day in days if day in DAY_TO_INDEX})
+    if indexes == [0, 1, 2, 3, 4]:
+        return "mon-fri"
+    if indexes == [0, 1, 2, 3, 4, 5, 6]:
+        return "mon-sun"
+    if indexes == [0, 1, 2, 3, 6]:
+        return "sun-thu"
+    reverse_days = {value: key for key, value in DAY_TO_INDEX.items()}
+    return ",".join(reverse_days[index] for index in indexes)
+
+
+def normalize_day_name(value: str) -> str:
+    """Normalize MQL5 day names to mon/tue/..."""
+
+    normalized = value.strip().lower()
+    mapping = {
+        "monday": "mon",
+        "tuesday": "tue",
+        "wednesday": "wed",
+        "thursday": "thu",
+        "friday": "fri",
+        "saturday": "sat",
+        "sunday": "sun",
+    }
+    return mapping.get(normalized, normalized[:3])
+
+
+def default_window_for_classification(
+    symbol: str,
+    ticker_type: str,
+    session_group: str,
+    metadata: dict[str, Any],
+    local_day: date,
+) -> tuple[str, str, str]:
+    """Return strategy session defaults, using timezone conversion when useful."""
+
+    local_tz = DEFAULT_TIMEZONE
+    text = build_classification_text(symbol, "", metadata)
+    if session_group == "us_stock_index" and ticker_type in {"us_stock", "us_etf"}:
+        start, end = convert_exchange_session_to_local(
+            "09:30",
+            "16:00",
+            "America/New_York",
+            local_tz,
+            local_day,
+        )
+        return start, end, "mon-fri"
+    if session_group == "europe_stock_index" and "london" in text:
+        start, end = convert_exchange_session_to_local(
+            "08:00",
+            "16:30",
+            "Europe/London",
+            local_tz,
+            local_day,
+        )
+        return start, end, "mon-fri"
+    if session_group == "europe_stock_index" and ticker_type == "europe_stock":
+        start, end = convert_exchange_session_to_local(
+            "09:00",
+            "17:30",
+            "Europe/Amsterdam",
+            local_tz,
+            local_day,
+        )
+        return start, end, "mon-fri"
+    return GROUP_DEFAULT_WINDOWS.get(session_group, GROUP_DEFAULT_WINDOWS["unknown"])
+
+
+def convert_exchange_session_to_local(
+    open_time: str,
+    close_time: str,
+    exchange_tz: str,
+    local_tz: str,
+    date: date,
+) -> tuple[str, str]:
+    """Convert exchange regular-session times to local times using zoneinfo."""
+
+    exchange_zone = ZoneInfo(exchange_tz)
+    local_zone = ZoneInfo(local_tz)
+    open_dt = datetime.combine(date, parse_hhmm(open_time), tzinfo=exchange_zone)
+    close_dt = datetime.combine(date, parse_hhmm(close_time), tzinfo=exchange_zone)
+    return (
+        open_dt.astimezone(local_zone).strftime("%H:%M"),
+        close_dt.astimezone(local_zone).strftime("%H:%M"),
+    )
+
+
+def detect_trading_window(
+    metadata: dict[str, Any],
+    raw_sessions: dict[str, list[list[str]]] | None = None,
+) -> tuple[str, str, str, str]:
+    """Return start/end/days/source from exact sessions or metadata."""
+
+    if raw_sessions:
+        start, end, days = summarize_raw_sessions(raw_sessions)
+        if start or end:
+            return start, end, days, "mt5_sessions"
 
     start = _normalize_hhmm(
         metadata.get("start_trade_time")
@@ -492,8 +727,139 @@ def detect_trading_window(metadata: dict[str, Any]) -> tuple[str, str, str]:
     )
     days = str(metadata.get("trading_days") or "").strip().lower()
     if start or end:
-        return start, end, days or "mon-fri"
-    return "", "", days or "unknown"
+        return start, end, days or "mon-fri", "mt5_metadata"
+    return "", "", days or "unknown", "unknown"
+
+
+def classify_ticker_from_metadata(
+    symbol: str,
+    description: str,
+    metadata: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Classify a ticker into type, session_group, and readable reason."""
+
+    symbol_key = _symbol_key(symbol)
+    text = build_classification_text(symbol, description, metadata)
+    text_upper = text.upper()
+    text_tokens = set(re.findall(r"[a-z0-9]+", text))
+    start = str(metadata.get("start_trade_time") or "")
+    end = str(metadata.get("end_trade_time") or "")
+
+    if _looks_like_us_session(start, end):
+        return "us_stock", "us_stock_index", "MT5 session resembles US market hours"
+    if _looks_like_europe_session(start, end):
+        return (
+            "europe_stock",
+            "europe_stock_index",
+            "MT5 session resembles European market hours",
+        )
+
+    crypto_base = symbol_key[:-3] if symbol_key.endswith("USD") else symbol_key
+    if crypto_base in classification_rules.CRYPTO_BASE_CODES:
+        return "crypto", "crypto_24_7", f"Symbol matched crypto code: {crypto_base}"
+    for marker in classification_rules.CRYPTO_MARKERS:
+        if _marker_matches(marker, text, text_tokens):
+            return "crypto", "crypto_24_7", f"Text matched crypto marker: {marker}"
+
+    if _symbol_looks_like_commodity(symbol_key):
+        return "commodity", "commodity_us", f"Symbol matched commodity pattern: {symbol}"
+    for marker in classification_rules.COMMODITY_MARKERS:
+        if _marker_matches(marker, text, text_tokens):
+            return "commodity", "commodity_us", f"Text matched commodity keyword: {marker}"
+
+    if symbol_key in classification_rules.FOREX_MAJOR_SYMBOLS:
+        return "forex", "forex_major", "Symbol matched forex major pair"
+    if _looks_like_forex_pair(symbol_key):
+        return "forex", "forex_exotic", "Symbol matched six-letter forex pair"
+
+    if symbol_key in classification_rules.US_INDEX_ALIASES:
+        return "us_index", "us_stock_index", f"Symbol matched US index: {symbol}"
+    if symbol_key in classification_rules.EUROPE_INDEX_ALIASES:
+        return (
+            "europe_index",
+            "europe_stock_index",
+            f"Symbol matched European index: {symbol}",
+        )
+    if symbol_key in classification_rules.ASIA_INDEX_ALIASES:
+        group = "israel_index" if symbol_key == "TA35" else "asia_index"
+        ticker_type = "israel_index" if symbol_key == "TA35" else "asia_index"
+        return ticker_type, group, f"Symbol matched Asian/Israel index: {symbol}"
+
+    if "NDAQ 100" in text_upper or "NASDAQ 100" in text_upper or "DJ 30" in text_upper:
+        return "us_index", "us_stock_index", "Description matched US index"
+    if "NETHERLANDS 25" in text_upper or "FRANCE 40" in text_upper:
+        return "europe_index", "europe_stock_index", "Description matched European index"
+    if "CHINA 50" in text_upper or "JAPAN 225" in text_upper or "NIKKEI" in text_upper:
+        return "asia_index", "asia_index", "Description matched Asian index"
+
+    if symbol_key in classification_rules.KNOWN_US_ETFS:
+        return "us_etf", "us_stock_index", f"Symbol matched known US ETF: {symbol}"
+    if symbol_key in classification_rules.KNOWN_US_STOCKS:
+        return "us_stock", "us_stock_index", f"Symbol matched known US stock: {symbol}"
+    for marker in classification_rules.US_METADATA_MARKERS:
+        if _marker_matches(marker, text, text_tokens):
+            ticker_type = "us_index" if _looks_like_index(text_upper) else "us_stock"
+            return ticker_type, "us_stock_index", f"Metadata matched US marker: {marker}"
+
+    if symbol_key in classification_rules.KNOWN_EUROPE_STOCKS:
+        return (
+            "europe_stock",
+            "europe_stock_index",
+            f"Symbol matched known European stock: {symbol}",
+        )
+    for marker in classification_rules.EUROPE_METADATA_MARKERS:
+        if _marker_matches(marker, text, text_tokens):
+            ticker_type = (
+                "europe_index" if _looks_like_index(text_upper) else "europe_stock"
+            )
+            return (
+                ticker_type,
+                "europe_stock_index",
+                f"Metadata matched European marker: {marker}",
+            )
+
+    if "stock" in text or "shares" in text or "equities" in text:
+        return "us_stock", "us_stock_index", "Metadata indicated stock/equity"
+    if "etf" in text:
+        return "us_etf", "us_stock_index", "Metadata indicated ETF"
+
+    return "unknown", "unknown", "No metadata, session, rule, or override matched"
+
+
+def _marker_matches(marker: str, text: str, tokens: set[str]) -> bool:
+    """Return true for whole-token markers or exact phrase markers."""
+
+    normalized = marker.lower().strip()
+    if not normalized:
+        return False
+    if " " in normalized or "." in normalized:
+        return normalized in text
+    return normalized in tokens
+
+
+def build_classification_text(
+    symbol: str,
+    description: str,
+    metadata: dict[str, Any],
+) -> str:
+    """Build lowercase searchable classification text from MT5 metadata."""
+
+    parts = [
+        symbol,
+        description or "",
+        metadata.get("path", "") or "",
+        metadata.get("category", "") or "",
+        metadata.get("exchange", "") or "",
+        metadata.get("country", "") or "",
+        metadata.get("currency_base", "") or "",
+        metadata.get("currency_profit", "") or "",
+        metadata.get("sector", "") or "",
+        metadata.get("industry", "") or "",
+        metadata.get("sector_name", "") or "",
+        metadata.get("industry_name", "") or "",
+        metadata.get("page", "") or "",
+    ]
+    return " ".join(_safe_text(part) for part in parts).lower()
 
 
 def classify_ticker(
@@ -501,43 +867,14 @@ def classify_ticker(
     description: str,
     metadata: dict[str, Any],
 ) -> tuple[str, str]:
-    """Classify a ticker into a ticker_type and scheduler session_group."""
+    """Backward-compatible wrapper returning ticker_type and session_group."""
 
-    symbol_key = _symbol_key(symbol)
-    searchable = f"{symbol_key} {description} {metadata.get('path', '')}".upper()
-    start = str(metadata.get("start_trade_time") or "")
-    end = str(metadata.get("end_trade_time") or "")
-
-    if _looks_like_us_session(start, end):
-        return "us_stock", "us_stock_index"
-    if _looks_like_europe_session(start, end):
-        return "europe_stock", "europe_stock_index"
-
-    if any(token in searchable for token in CRYPTO_TOKENS):
-        if symbol_key.endswith("USD") or "CRYPTO" in searchable:
-            return "crypto", "crypto_24_7"
-    if "CRYPTO" in searchable:
-        return "crypto", "crypto_24_7"
-
-    if any(token in searchable for token in COMMODITY_HINTS):
-        return "commodity", "commodity_us"
-
-    if symbol_key in FOREX_MAJOR_SYMBOLS:
-        return "forex", "forex_major"
-    if _looks_like_forex_pair(symbol_key):
-        return "forex", "forex_exotic"
-
-    if any(token in searchable for token in US_HINTS):
-        ticker_type = "us_index" if _looks_like_index(searchable) else "us_stock"
-        return ticker_type, "us_stock_index"
-
-    if any(token in searchable for token in EUROPE_HINTS):
-        ticker_type = (
-            "europe_index" if _looks_like_index(searchable) else "europe_stock"
-        )
-        return ticker_type, "europe_stock_index"
-
-    return "unknown", "unknown"
+    ticker_type, session_group, _ = classify_ticker_from_metadata(
+        symbol,
+        description,
+        metadata,
+    )
+    return ticker_type, session_group
 
 
 def is_entry_price_still_valid(
@@ -1097,9 +1434,24 @@ def main() -> None:
         action="store_true",
         help="Run offline self-tests and exit.",
     )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=[UPDATE_COMMAND],
+        help="Optional one-shot command. Use 'update' to refresh ticker metadata.",
+    )
+    parser.add_argument(
+        "--debug-symbol",
+        default=None,
+        help="With 'update', print full MT5 metadata for this symbol.",
+    )
     args = parser.parse_args()
     if args.self_test:
         run_self_test()
+        return
+    if args.command == UPDATE_COMMAND:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        update_ticker_trading_times(debug_symbol=args.debug_symbol)
         return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1270,7 +1622,31 @@ def _time_between(value: str, start: str, end: str) -> bool:
 def _looks_like_forex_pair(symbol_key: str) -> bool:
     if not re.fullmatch(r"[A-Z]{6}", symbol_key):
         return False
-    return symbol_key[:3] in FIAT_CODES and symbol_key[3:] in FIAT_CODES
+    return (
+        symbol_key[:3] in classification_rules.CURRENCY_CODES
+        and symbol_key[3:] in classification_rules.CURRENCY_CODES
+    )
+
+
+def _symbol_looks_like_commodity(symbol_key: str) -> bool:
+    commodity_codes = {
+        "BRENT",
+        "COCOA",
+        "COFFEE",
+        "CORN",
+        "COTTON",
+        "GOLD",
+        "NGAS",
+        "OIL",
+        "SILVER",
+        "SOYBEAN",
+        "SUGAR",
+        "WHEAT",
+        "WTI",
+        "XAG",
+        "XAU",
+    }
+    return any(symbol_key.startswith(code) for code in commodity_codes)
 
 
 def _looks_like_index(text: str) -> bool:
