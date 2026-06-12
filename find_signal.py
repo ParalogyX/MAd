@@ -435,12 +435,15 @@ def calculate_daily_sl_tp(
     direction: str,
     signal_strength: float,
     atr_1d: float,
+    sl_multiplier: float = 0.45,
+    tp_base_multiplier: float = 0.60,
+    tp_strength_multiplier: float = 0.25,
 ) -> dict[str, Any]:
     """Calculate stop-loss and take-profit levels for daily signals.
 
     This function does not place trades. It only returns calculated levels.
-    Stop-loss distance is volatility-based and is not widened by signal
-    strength; signal strength only slightly adjusts take-profit distance.
+    The current_price argument is the price used for the calculated levels.
+    Session-specific multipliers can override the defaults.
     """
 
     atr_value = _to_float(atr_1d)
@@ -474,9 +477,10 @@ def calculate_daily_sl_tp(
     )
     usable_atr_1d = price_value * usable_atr_percent
 
-    sl_multiplier = 0.45
     sl_distance = sl_multiplier * usable_atr_1d
-    tp_multiplier = 0.60 + 0.25 * (strength_value / 100.0)
+    tp_multiplier = tp_base_multiplier + tp_strength_multiplier * (
+        strength_value / 100.0
+    )
     tp_distance = tp_multiplier * usable_atr_1d
     risk_reward_ratio = tp_distance / sl_distance
 

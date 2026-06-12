@@ -96,6 +96,34 @@ class MT5InstrumentProvider(MT5BaseProvider, InstrumentProvider):
 
         return sorted(unique_symbols.values(), key=lambda value: value.upper())
 
+    def find_instrument_metadata(self) -> list[dict[str, Any]]:
+        """Return tradable MT5 symbols with best-effort metadata."""
+
+        client = self._get_client()
+        symbols = client.symbols_get()
+        if not symbols:
+            raise DataProviderError(
+                "MT5 returned no symbols. Last error: " f"{_last_error(client)}"
+            )
+
+        metadata_rows: list[dict[str, Any]] = []
+        for symbol_info in symbols:
+            name = _symbol_name(symbol_info)
+            if not name or not _is_tradable(symbol_info):
+                continue
+            metadata = _symbol_info_to_dict(symbol_info)
+            if hasattr(client, "symbol_info"):
+                try:
+                    metadata.update(_symbol_info_to_dict(client.symbol_info(name)))
+                except Exception:
+                    pass
+            metadata["name"] = name
+            metadata_rows.append(metadata)
+
+        if not metadata_rows:
+            raise DataProviderError("MT5 returned symbols, but none were tradable.")
+        return metadata_rows
+
 
 class MT5MarketDataProvider(MT5BaseProvider, MarketDataProvider):
     """Load historical OHLCV candles from MetaTrader 5."""
@@ -276,6 +304,29 @@ def _symbol_name(symbol_info: Any) -> str:
     if isinstance(symbol_info, dict):
         return str(symbol_info.get("name", "")).strip()
     return str(getattr(symbol_info, "name", "")).strip()
+
+
+def _symbol_info_to_dict(symbol_info: Any) -> dict[str, Any]:
+    if symbol_info is None:
+        return {}
+    if isinstance(symbol_info, dict):
+        return dict(symbol_info)
+    if hasattr(symbol_info, "_asdict"):
+        return dict(symbol_info._asdict())
+
+    values: dict[str, Any] = {}
+    for name in dir(symbol_info):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(symbol_info, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        if isinstance(value, (str, int, float, bool, type(None))):
+            values[name] = value
+    return values
 
 
 def _is_tradable(symbol_info: Any) -> bool:
