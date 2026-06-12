@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import inspect
 import json
 import logging
 import math
@@ -46,6 +47,8 @@ TRIGGER_COMMAND = "now"
 UPDATE_COMMAND = "update"
 RELOAD_COMMAND = "reload"
 STATUS_COMMAND = "status"
+SIGNALS_COMMAND = "signals"
+SIGNALS_ALIAS = "sig"
 QUIT_COMMAND = "quit"
 LEGACY_EXIT_COMMAND = "stop"
 LOGGER = logging.getLogger("trade_signal_generator")
@@ -108,6 +111,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "15:05",
             "close_time": "21:45",
             "trading_days": "mon-sun",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.40,
             "tp_base_multiplier": 0.50,
             "tp_strength_multiplier": 0.20,
@@ -118,6 +122,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "09:05",
             "close_time": "21:45",
             "trading_days": "mon-fri",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.45,
             "tp_base_multiplier": 0.60,
             "tp_strength_multiplier": 0.25,
@@ -128,6 +133,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "09:15",
             "close_time": "18:30",
             "trading_days": "mon-fri",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.45,
             "tp_base_multiplier": 0.55,
             "tp_strength_multiplier": 0.20,
@@ -138,6 +144,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "09:10",
             "close_time": "17:20",
             "trading_days": "mon-fri",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.40,
             "tp_base_multiplier": 0.50,
             "tp_strength_multiplier": 0.20,
@@ -148,6 +155,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "15:45",
             "close_time": "21:45",
             "trading_days": "mon-fri",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.40,
             "tp_base_multiplier": 0.50,
             "tp_strength_multiplier": 0.20,
@@ -158,6 +166,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "15:45",
             "close_time": "21:45",
             "trading_days": "mon-fri",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.40,
             "tp_base_multiplier": 0.50,
             "tp_strength_multiplier": 0.20,
@@ -168,6 +177,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "02:15",
             "close_time": "08:30",
             "trading_days": "mon-fri",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.40,
             "tp_base_multiplier": 0.50,
             "tp_strength_multiplier": 0.20,
@@ -178,6 +188,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "09:00",
             "close_time": "16:00",
             "trading_days": "sun-thu",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.40,
             "tp_base_multiplier": 0.50,
             "tp_strength_multiplier": 0.20,
@@ -188,6 +199,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
             "open_time": "09:05",
             "close_time": "21:45",
             "trading_days": "mon-fri",
+            "min_signal_strength": 60,
             "sl_multiplier": 0.45,
             "tp_base_multiplier": 0.60,
             "tp_strength_multiplier": 0.25,
@@ -293,6 +305,12 @@ def print_command_help() -> None:
         flush=True,
     )
     print(
+        f"  {SIGNALS_COMMAND:<7} Generate final trade-plan CSV files now for all "
+        "enabled groups that already have a today's best_signals_<group>_*.csv "
+        f"candidate file. Alias: {SIGNALS_ALIAS}.",
+        flush=True,
+    )
+    print(
         f"  {QUIT_COMMAND:<7} Stop the scheduler cleanly. Legacy command "
         f"'{LEGACY_EXIT_COMMAND}' also stops it.",
         flush=True,
@@ -359,14 +377,36 @@ def ensure_session_rules_file(path: Path | None = None) -> Path:
         return rules_path
 
     merged_rules = merge_session_rules(existing_rules)
-    existing_groups = set(existing_rules.get("session_groups", {}))
-    default_groups = set(DEFAULT_SESSION_RULES["session_groups"])
-    if default_groups - existing_groups:
+    if session_rules_need_migration(existing_rules):
         rules_path.write_text(
             json.dumps(merged_rules, indent=2),
             encoding="utf-8",
         )
     return rules_path
+
+
+def session_rules_need_migration(existing_rules: dict[str, Any]) -> bool:
+    """Return True when the editable rules file is missing default keys."""
+
+    existing_groups = existing_rules.get("session_groups", {})
+    if not isinstance(existing_groups, dict):
+        return True
+    for group_name, default_group in DEFAULT_SESSION_RULES["session_groups"].items():
+        existing_group = existing_groups.get(group_name)
+        if not isinstance(existing_group, dict):
+            return True
+        for key in default_group:
+            if key not in existing_group:
+                return True
+    for key in [
+        "timezone",
+        "best_signal_limit",
+        "entry_check_minutes_before_open",
+        "rules_reload_interval_seconds",
+    ]:
+        if key not in existing_rules:
+            return True
+    return False
 
 
 def load_session_rules(
@@ -1078,6 +1118,7 @@ def run_analysis_for_group(
         timestamp = now or datetime.now(timezone.utc)
         timezone_info = rules_timezone(rules)
         local_timestamp = timestamp.astimezone(timezone_info)
+        group_rule = rules["session_groups"][session_group]
         tickers = tickers_for_group(ticker_metadata, session_group)
         rows = analyze_group_tickers(tickers, processor=processor)
         with timed_task("build_candidate_dataframe", session_group=session_group):
@@ -1149,7 +1190,7 @@ def run_trade_plan_for_group(
     rules: dict[str, Any],
     ticker_metadata: pd.DataFrame,
     now: datetime | None = None,
-    price_loader: Callable[[str], float | None] = get_current_price,
+    price_loader: Callable[..., float | None] = get_current_price,
 ) -> Path:
     """Generate the final trade-plan CSV for one session group."""
 
@@ -1188,13 +1229,57 @@ def run_trade_plan_for_group(
         return output_path
 
 
+def run_trade_plans_for_all_available_groups(
+    rules: dict[str, Any],
+    ticker_metadata: pd.DataFrame,
+    now: datetime | None = None,
+    price_loader: Callable[..., float | None] = get_current_price,
+) -> list[Path]:
+    """Generate trade plans now for enabled groups with existing candidates."""
+
+    with timed_task("run_trade_plans_for_all_available_groups"):
+        output_paths: list[Path] = []
+        for group_name, group_rule in rules.get("session_groups", {}).items():
+            if not group_rule.get("enabled", False):
+                LOGGER.info("Skipping disabled session group for signals: %s", group_name)
+                continue
+            try:
+                output_paths.append(
+                    run_trade_plan_for_group(
+                        group_name,
+                        rules,
+                        ticker_metadata,
+                        now=now,
+                        price_loader=price_loader,
+                    )
+                )
+            except FileNotFoundError as exc:
+                LOGGER.info(
+                    "Skipping signals command for %s: candidate file missing: %s",
+                    group_name,
+                    exc,
+                )
+                print(
+                    f"No best_signals candidate file for {group_name}; skipped.",
+                    flush=True,
+                )
+            except Exception:
+                LOGGER.exception("Failed to generate trade plan for %s", group_name)
+                raise
+        print(
+            f"Generated {len(output_paths)} trade-plan file(s) from existing candidates.",
+            flush=True,
+        )
+        return output_paths
+
+
 def build_trade_plan_rows(
     candidates: pd.DataFrame,
     ticker_metadata: pd.DataFrame,
     session_group: str,
     group_rule: dict[str, Any],
     local_timestamp: datetime,
-    price_loader: Callable[[str], float | None] = get_current_price,
+    price_loader: Callable[..., float | None] = get_current_price,
 ) -> list[dict[str, Any]]:
     """Build validated trade-plan rows from candidate signals."""
 
@@ -1217,8 +1302,22 @@ def build_trade_plan_rows(
                 continue
 
             try:
+                signal_strength = _to_float(candidate.get("signal_strength")) or 0.0
+                min_strength = float(group_rule.get("min_signal_strength", 60))
+                if signal_strength < min_strength:
+                    LOGGER.info(
+                        "Skipping %s because signal_strength %.2f is below %.2f",
+                        ticker,
+                        signal_strength,
+                        min_strength,
+                    )
+                    continue
                 with timed_task("fetch_entry_price", ticker=ticker):
-                    entry_price = price_loader(ticker)
+                    entry_price = call_price_loader(
+                        price_loader=price_loader,
+                        ticker=ticker,
+                        direction=direction,
+                    )
                 entry_value = _to_float(entry_price)
                 if entry_value is None or entry_value <= 0:
                     LOGGER.info("Skipping %s because entry price is invalid", ticker)
@@ -1245,7 +1344,6 @@ def build_trade_plan_rows(
                     continue
 
                 atr_1d = _to_float(candidate.get("atr_1d"))
-                signal_strength = _to_float(candidate.get("signal_strength")) or 0.0
                 with timed_task("calculate_entry_sl_tp", ticker=ticker):
                     sl_tp = calculate_daily_sl_tp(
                         current_price=entry_value,
@@ -1296,6 +1394,29 @@ def build_trade_plan_rows(
                 print(f"WARNING: skipped {ticker} at entry validation: {exc}", flush=True)
                 continue
         return rows
+
+
+def call_price_loader(
+    price_loader: Callable[..., float | None],
+    ticker: str,
+    direction: str,
+) -> float | None:
+    """Fetch a quote, passing trade direction when the loader supports it."""
+
+    try:
+        signature = inspect.signature(price_loader)
+    except (TypeError, ValueError):
+        return price_loader(ticker)
+
+    parameters = signature.parameters.values()
+    accepts_side = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or parameter.name == "side"
+        for parameter in parameters
+    )
+    if accepts_side:
+        return price_loader(ticker, side=direction)
+    return price_loader(ticker)
 
 
 def add_metadata_columns(
@@ -1645,12 +1766,12 @@ def main() -> None:
     print(f"Session rules loaded from {session_rules_path()}.", flush=True)
 
     print(
-        "Startup metadata refresh is beginning. The command loop becomes ready "
-        "after this step finishes.",
+        "Reading existing ticker_trading_times.csv. MT5 metadata is refreshed "
+        "only when you type 'update'.",
         flush=True,
     )
-    with timed_task("startup_metadata_refresh"):
-        ticker_metadata = _safe_update_or_read_metadata()
+    with timed_task("startup_read_ticker_metadata"):
+        ticker_metadata = _safe_read_existing_metadata()
     print(
         f"Startup metadata ready: {len(ticker_metadata)} tickers loaded.",
         flush=True,
@@ -1692,6 +1813,15 @@ def main() -> None:
                     print("Reloaded session rules.", flush=True)
                 elif normalized_command == STATUS_COMMAND:
                     print_status(rules, ticker_metadata, executed_events)
+                elif normalized_command in {SIGNALS_COMMAND, SIGNALS_ALIAS}:
+                    try:
+                        run_trade_plans_for_all_available_groups(
+                            rules,
+                            ticker_metadata,
+                        )
+                    except Exception as exc:
+                        LOGGER.exception("Manual signals command failed")
+                        print(f"ERROR generating trade plans: {exc}", flush=True)
                 else:
                     print("unknown command", flush=True)
             print_console_ready()
@@ -1731,17 +1861,19 @@ def main() -> None:
             print_console_ready()
 
 
-def _safe_update_or_read_metadata() -> pd.DataFrame:
-    with timed_task("safe_update_or_read_metadata"):
-        try:
-            return update_ticker_trading_times()
-        except Exception as exc:
-            LOGGER.exception("Startup metadata update failed; reading existing CSV")
+def _safe_read_existing_metadata() -> pd.DataFrame:
+    """Read existing ticker metadata without contacting MT5."""
+
+    with timed_task("safe_read_existing_metadata"):
+        metadata = read_ticker_trading_times()
+        if metadata.empty:
             print(
-                f"WARNING: could not update ticker metadata on startup: {exc}",
+                "WARNING: ticker_trading_times.csv is missing or empty. "
+                "Type 'update' to fetch MT5 symbol metadata.",
                 flush=True,
             )
-            return read_ticker_trading_times()
+            LOGGER.warning("ticker_trading_times.csv missing or empty at startup")
+        return metadata
 
 
 def adjusted_open_event_time(open_time: str, minutes_before_open: int) -> str:

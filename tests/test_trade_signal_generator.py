@@ -1,3 +1,4 @@
+import copy
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -9,6 +10,7 @@ from trade_signal_generator import (
     SESSION_RULES_FILE,
     analyze_group_tickers,
     build_ticker_trading_times,
+    call_price_loader,
     build_trade_plan_rows,
     classify_ticker,
     classify_ticker_from_metadata,
@@ -19,7 +21,11 @@ from trade_signal_generator import (
     load_mt5_symbol_sessions,
     load_session_rules,
     parse_trading_days,
+    read_ticker_trading_times,
+    run_analysis_for_group,
+    run_trade_plans_for_all_available_groups,
 )
+import trade_signal_generator as tsg
 
 
 def test_session_rules_loading_and_invalid_json_fallback(tmp_path):
@@ -245,6 +251,22 @@ def test_entry_price_validation():
     assert loose[0] is True
 
 
+def test_side_aware_price_loader_receives_direction():
+    calls = []
+
+    def side_aware_loader(ticker, side=None):
+        calls.append((ticker, side))
+        return 1.2
+
+    def one_argument_loader(ticker):
+        calls.append((ticker, None))
+        return 1.1
+
+    assert call_price_loader(side_aware_loader, "EURUSD", "buy") == 1.2
+    assert call_price_loader(one_argument_loader, "GBPUSD", "sell") == 1.1
+    assert calls == [("EURUSD", "buy"), ("GBPUSD", None)]
+
+
 def test_trade_plan_uses_entry_price_and_session_multipliers():
     crypto_rule = DEFAULT_SESSION_RULES["session_groups"]["crypto_24_7"]
     forex_rule = DEFAULT_SESSION_RULES["session_groups"]["forex_major"]
@@ -335,3 +357,120 @@ def test_neutral_signals_and_failed_tickers_do_not_stop_group():
     assert len(analysis_rows) == 2
     assert analysis_rows[1]["ticker"] == "BAD"
     assert analysis_rows[1]["direction"] == "neutral"
+
+
+def test_startup_reads_existing_metadata_without_update(monkeypatch, tmp_path):
+    monkeypatch.setattr(tsg, "OUTPUT_DIR", tmp_path)
+    metadata_path = tmp_path / "ticker_trading_times.csv"
+    metadata_path.write_text(
+        "ticker,description,session_group\nEURUSD,Euro,forex_major\n",
+        encoding="utf-8",
+    )
+
+    def fail_update(*args, **kwargs):
+        raise AssertionError("startup must not refresh MT5 metadata")
+
+    monkeypatch.setattr(tsg, "update_ticker_trading_times", fail_update)
+    data = tsg._safe_read_existing_metadata()
+
+    assert list(data["ticker"]) == ["EURUSD"]
+
+
+def test_manual_signals_command_skips_missing_candidates(monkeypatch, tmp_path):
+    monkeypatch.setattr(tsg, "OUTPUT_DIR", tmp_path)
+    rules = copy.deepcopy(DEFAULT_SESSION_RULES)
+    metadata = pd.DataFrame([{"ticker": "EURUSD", "session_group": "forex_major"}])
+
+    output_paths = run_trade_plans_for_all_available_groups(
+        rules,
+        metadata,
+        now=datetime(2026, 6, 12, 9, 5, tzinfo=ZoneInfo("UTC")),
+        price_loader=lambda ticker: 100.0,
+    )
+
+    assert output_paths == []
+
+
+def test_manual_signals_command_generates_existing_candidate(monkeypatch, tmp_path):
+    monkeypatch.setattr(tsg, "OUTPUT_DIR", tmp_path)
+    rules = copy.deepcopy(DEFAULT_SESSION_RULES)
+    for group_name, group_rule in rules["session_groups"].items():
+        group_rule["enabled"] = group_name == "forex_major"
+
+    local_time = datetime(2026, 6, 12, 9, 5, tzinfo=ZoneInfo("Europe/Amsterdam"))
+    candidate_path = tsg.candidate_output_path("forex_major", local_time)
+    pd.DataFrame(
+        [
+            {
+                "ticker": "EURUSD",
+                "direction": "buy",
+                "current_price": 100,
+                "analysis_price": 100,
+                "atr_percent_1d": 0.03,
+                "atr_1d": 3,
+                "signal_strength": 80,
+                "reason": "test",
+            }
+        ]
+    ).to_csv(candidate_path, index=False)
+    metadata = pd.DataFrame(
+        [{"ticker": "EURUSD", "description": "Euro", "session_group": "forex_major"}]
+    )
+
+    output_paths = run_trade_plans_for_all_available_groups(
+        rules,
+        metadata,
+        now=local_time.astimezone(ZoneInfo("UTC")),
+        price_loader=lambda ticker: 100.1,
+    )
+
+    assert len(output_paths) == 1
+    trade_plan = pd.read_csv(output_paths[0])
+    assert list(trade_plan["ticker"]) == ["EURUSD"]
+
+
+def test_min_signal_strength_filters_trade_plan_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(tsg, "OUTPUT_DIR", tmp_path)
+    rules = copy.deepcopy(DEFAULT_SESSION_RULES)
+    rules["session_groups"]["forex_major"]["min_signal_strength"] = 60
+    metadata = pd.DataFrame(
+        [
+            {"ticker": "LOW", "session_group": "forex_major"},
+            {"ticker": "HIGH", "session_group": "forex_major"},
+        ]
+    )
+
+    def processor(ticker):
+        strength = 59 if ticker == "LOW" else 60
+        return {
+            "ticker": ticker,
+            "current_price": 100,
+            "direction": "buy",
+            "signal_strength": strength,
+            "reason": "test",
+            "timestamp_utc": "2026-06-12T07:00:00+00:00",
+            "atr_1d": 3,
+            "atr_percent_1d": 0.03,
+            "stop_loss": 99,
+            "take_profit": 101,
+        }
+
+    output_path = run_analysis_for_group(
+        "forex_major",
+        rules,
+        metadata,
+        now=datetime(2026, 6, 12, 7, 0, tzinfo=ZoneInfo("UTC")),
+        processor=processor,
+    )
+
+    candidates = pd.read_csv(output_path)
+    assert list(candidates["ticker"]) == ["HIGH", "LOW"]
+
+    trade_paths = run_trade_plans_for_all_available_groups(
+        rules,
+        metadata,
+        now=datetime(2026, 6, 12, 7, 5, tzinfo=ZoneInfo("UTC")),
+        price_loader=lambda ticker: 100.1,
+    )
+    trade_plan = pd.read_csv(trade_paths[0])
+    assert list(trade_plan["ticker"]) == ["HIGH"]
