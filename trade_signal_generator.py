@@ -9,13 +9,16 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import math
 import os
 import queue
 import re
 import threading
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -38,12 +41,17 @@ SESSION_RULES_FILE = "session_rules.json"
 TICKER_TRADING_TIMES_FILE = "ticker_trading_times.csv"
 MT5_SYMBOL_SESSIONS_FILE = "mt5_symbol_sessions.csv"
 CLASSIFICATION_OVERRIDES_FILE = "ticker_classification_overrides.csv"
+LOG_FILE = "trade_signal_generator.log"
 TRIGGER_COMMAND = "now"
 UPDATE_COMMAND = "update"
 RELOAD_COMMAND = "reload"
 STATUS_COMMAND = "status"
 QUIT_COMMAND = "quit"
 LEGACY_EXIT_COMMAND = "stop"
+LOGGER = logging.getLogger("trade_signal_generator")
+LOGGER.addHandler(logging.NullHandler())
+LOGGER.propagate = False
+_LOGGING_CONFIGURED = False
 
 DEFAULT_TIMEZONE = "Europe/Amsterdam"
 METADATA_COLUMNS = [
@@ -209,6 +217,95 @@ GROUP_DEFAULT_WINDOWS = {
 }
 
 
+def setup_logging() -> Path:
+    """Configure file logging for scheduler timings and operational events."""
+
+    global _LOGGING_CONFIGURED
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = OUTPUT_DIR / LOG_FILE
+    if _LOGGING_CONFIGURED:
+        return log_path
+
+    LOGGER.setLevel(logging.INFO)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    LOGGER.addHandler(handler)
+    LOGGER.propagate = False
+    _LOGGING_CONFIGURED = True
+    LOGGER.info("Logging initialized at %s", log_path)
+    return log_path
+
+
+@contextmanager
+def timed_task(task_name: str, **context: Any):
+    """Log task start, success/failure, and elapsed time."""
+
+    context_text = _format_log_context(context)
+    LOGGER.info("START %s%s", task_name, context_text)
+    started_at = perf_counter()
+    try:
+        yield
+    except Exception:
+        elapsed = perf_counter() - started_at
+        LOGGER.exception("FAILED %s after %.3fs%s", task_name, elapsed, context_text)
+        raise
+    else:
+        elapsed = perf_counter() - started_at
+        LOGGER.info("DONE %s in %.3fs%s", task_name, elapsed, context_text)
+
+
+def _format_log_context(context: dict[str, Any]) -> str:
+    if not context:
+        return ""
+    parts = [f"{key}={value}" for key, value in context.items()]
+    return " [" + ", ".join(parts) + "]"
+
+
+def print_command_help() -> None:
+    """Print detailed console command help."""
+
+    print("Console commands:", flush=True)
+    print(
+        f"  {TRIGGER_COMMAND:<7} Run analysis immediately for every enabled "
+        "session group using current session_rules.json and current "
+        "ticker_trading_times.csv.",
+        flush=True,
+    )
+    print(
+        f"  {UPDATE_COMMAND:<7} Connect to MT5, refresh symbol metadata, "
+        "apply session data and manual overrides, then rewrite "
+        "ticker_trading_times.csv.",
+        flush=True,
+    )
+    print(
+        f"  {RELOAD_COMMAND:<7} Reload session_rules.json now. If the JSON is "
+        "invalid, keep the last valid rules and continue running.",
+        flush=True,
+    )
+    print(
+        f"  {STATUS_COMMAND:<7} Print loaded session groups, tickers per group, "
+        "schedule times, trading days, and executed-event count.",
+        flush=True,
+    )
+    print(
+        f"  {QUIT_COMMAND:<7} Stop the scheduler cleanly. Legacy command "
+        f"'{LEGACY_EXIT_COMMAND}' also stops it.",
+        flush=True,
+    )
+
+
+def print_console_ready() -> None:
+    """Tell the user that console commands are being listened for."""
+
+    print("Console is listening for commands now.", flush=True)
+    print_command_help()
+
+
 def console_listener(commands: queue.Queue[str]) -> None:
     """Read console input without keeping the main scheduler busy."""
 
@@ -278,23 +375,24 @@ def load_session_rules(
 ) -> dict[str, Any]:
     """Load editable session rules, keeping the last valid rules on JSON error."""
 
-    rules_path = ensure_session_rules_file(path)
-    try:
-        raw_rules = json.loads(rules_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        if previous_rules is not None:
+    with timed_task("load_session_rules", path=path or session_rules_path()):
+        rules_path = ensure_session_rules_file(path)
+        try:
+            raw_rules = json.loads(rules_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            if previous_rules is not None:
+                print(
+                    f"WARNING: invalid {rules_path.name}; keeping last valid rules: {exc}",
+                    flush=True,
+                )
+                return previous_rules
             print(
-                f"WARNING: invalid {rules_path.name}; keeping last valid rules: {exc}",
+                f"WARNING: invalid {rules_path.name}; using built-in defaults: {exc}",
                 flush=True,
             )
-            return previous_rules
-        print(
-            f"WARNING: invalid {rules_path.name}; using built-in defaults: {exc}",
-            flush=True,
-        )
-        return copy.deepcopy(DEFAULT_SESSION_RULES)
+            return copy.deepcopy(DEFAULT_SESSION_RULES)
 
-    return merge_session_rules(raw_rules)
+        return merge_session_rules(raw_rules)
 
 
 def merge_session_rules(raw_rules: dict[str, Any]) -> dict[str, Any]:
@@ -378,28 +476,43 @@ def is_trading_day(trading_days: str, local_day: date) -> bool:
 def update_ticker_trading_times(debug_symbol: str | None = None) -> pd.DataFrame:
     """Discover MT5 instruments, classify sessions, save CSV, and return it."""
 
-    print("Updating ticker trading metadata from MT5...", flush=True)
-    print("Connecting to MT5 and requesting symbol metadata...", flush=True)
-    provider = MT5InstrumentProvider()
-    metadata_rows = provider.find_instrument_metadata()
-    if debug_symbol:
-        print_debug_symbol_metadata(metadata_rows, debug_symbol)
-    print(f"Received metadata for {len(metadata_rows)} tradable MT5 symbols.", flush=True)
-    print("Classifying tickers into session groups...", flush=True)
-    session_map = load_mt5_symbol_sessions()
-    overrides = load_classification_overrides()
-    data = build_ticker_trading_times(
-        metadata_rows,
-        session_map=session_map,
-        overrides=overrides,
-    )
-    output_path = ticker_trading_times_path()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    data.to_csv(output_path, index=False)
-    group_counts = data["session_group"].value_counts().to_dict() if not data.empty else {}
-    print(f"Saved {output_path.name} with {len(data)} tickers.", flush=True)
-    print(f"Ticker session groups: {group_counts}", flush=True)
-    return data
+    with timed_task("update_ticker_trading_times", debug_symbol=debug_symbol or ""):
+        print("Updating ticker trading metadata from MT5...", flush=True)
+        print("Connecting to MT5 and requesting symbol metadata...", flush=True)
+        provider = MT5InstrumentProvider()
+        with timed_task("mt5_fetch_symbol_metadata"):
+            metadata_rows = provider.find_instrument_metadata()
+        if debug_symbol:
+            print_debug_symbol_metadata(metadata_rows, debug_symbol)
+        print(
+            f"Received metadata for {len(metadata_rows)} tradable MT5 symbols.",
+            flush=True,
+        )
+        print("Classifying tickers into session groups...", flush=True)
+        session_map = load_mt5_symbol_sessions()
+        overrides = load_classification_overrides()
+        with timed_task(
+            "build_ticker_trading_times",
+            metadata_rows=len(metadata_rows),
+            sessions=len(session_map),
+            overrides=len(overrides),
+        ):
+            data = build_ticker_trading_times(
+                metadata_rows,
+                session_map=session_map,
+                overrides=overrides,
+            )
+        output_path = ticker_trading_times_path()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with timed_task("write_ticker_trading_times_csv", path=output_path, rows=len(data)):
+            data.to_csv(output_path, index=False)
+        group_counts = (
+            data["session_group"].value_counts().to_dict() if not data.empty else {}
+        )
+        LOGGER.info("ticker_trading_times group_counts=%s", group_counts)
+        print(f"Saved {output_path.name} with {len(data)} tickers.", flush=True)
+        print(f"Ticker session groups: {group_counts}", flush=True)
+        return data
 
 
 def build_ticker_trading_times(
@@ -516,32 +629,35 @@ def load_mt5_symbol_sessions(
     """Read optional mt5_symbol_sessions.csv dumped by the MQL5 helper."""
 
     sessions_path = path or mt5_symbol_sessions_path()
-    if not sessions_path.exists():
-        return {}
-    try:
-        sessions = pd.read_csv(sessions_path)
-    except Exception as exc:
-        print(f"WARNING: could not read {sessions_path.name}: {exc}", flush=True)
-        return {}
-    required = {"symbol", "day_of_week", "from_time", "to_time"}
-    if not required <= set(sessions.columns):
-        print(
-            f"WARNING: {sessions_path.name} is missing required columns: "
-            f"{', '.join(sorted(required - set(sessions.columns)))}",
-            flush=True,
-        )
-        return {}
+    with timed_task("load_mt5_symbol_sessions", path=sessions_path):
+        if not sessions_path.exists():
+            LOGGER.info("No MT5 session CSV found at %s", sessions_path)
+            return {}
+        try:
+            sessions = pd.read_csv(sessions_path)
+        except Exception as exc:
+            print(f"WARNING: could not read {sessions_path.name}: {exc}", flush=True)
+            return {}
+        required = {"symbol", "day_of_week", "from_time", "to_time"}
+        if not required <= set(sessions.columns):
+            print(
+                f"WARNING: {sessions_path.name} is missing required columns: "
+                f"{', '.join(sorted(required - set(sessions.columns)))}",
+                flush=True,
+            )
+            return {}
 
-    result: dict[str, dict[str, list[list[str]]]] = {}
-    for _, row in sessions.iterrows():
-        symbol = _symbol_key(str(row.get("symbol", "")))
-        day = normalize_day_name(str(row.get("day_of_week", "")))
-        start = _normalize_hhmm(row.get("from_time"))
-        end = _normalize_hhmm(row.get("to_time"))
-        if not symbol or not day or not start or not end:
-            continue
-        result.setdefault(symbol, {}).setdefault(day, []).append([start, end])
-    return result
+        result: dict[str, dict[str, list[list[str]]]] = {}
+        for _, row in sessions.iterrows():
+            symbol = _symbol_key(str(row.get("symbol", "")))
+            day = normalize_day_name(str(row.get("day_of_week", "")))
+            start = _normalize_hhmm(row.get("from_time"))
+            end = _normalize_hhmm(row.get("to_time"))
+            if not symbol or not day or not start or not end:
+                continue
+            result.setdefault(symbol, {}).setdefault(day, []).append([start, end])
+        LOGGER.info("Loaded MT5 sessions for %s symbols", len(result))
+        return result
 
 
 def load_classification_overrides(
@@ -550,29 +666,32 @@ def load_classification_overrides(
     """Read optional manual classification overrides."""
 
     override_path = path or classification_overrides_path()
-    if not override_path.exists():
-        return {}
-    try:
-        overrides = pd.read_csv(override_path).fillna("")
-    except Exception as exc:
-        print(f"WARNING: could not read {override_path.name}: {exc}", flush=True)
-        return {}
+    with timed_task("load_classification_overrides", path=override_path):
+        if not override_path.exists():
+            LOGGER.info("No classification override CSV found at %s", override_path)
+            return {}
+        try:
+            overrides = pd.read_csv(override_path).fillna("")
+        except Exception as exc:
+            print(f"WARNING: could not read {override_path.name}: {exc}", flush=True)
+            return {}
 
-    result: dict[str, dict[str, str]] = {}
-    for _, row in overrides.iterrows():
-        ticker = _symbol_key(str(row.get("ticker", "")))
-        if not ticker:
-            continue
-        result[ticker] = {
-            "ticker_type": str(row.get("ticker_type", "")).strip(),
-            "session_group": str(row.get("session_group", "")).strip(),
-            "start_trade_time": _normalize_hhmm(row.get("start_trade_time")),
-            "end_trade_time": _normalize_hhmm(row.get("end_trade_time")),
-            "trading_days": str(row.get("trading_days", "")).strip(),
-            "description_override": str(row.get("description_override", "")).strip(),
-            "reason": str(row.get("reason", "")).strip(),
-        }
-    return result
+        result: dict[str, dict[str, str]] = {}
+        for _, row in overrides.iterrows():
+            ticker = _symbol_key(str(row.get("ticker", "")))
+            if not ticker:
+                continue
+            result[ticker] = {
+                "ticker_type": str(row.get("ticker_type", "")).strip(),
+                "session_group": str(row.get("session_group", "")).strip(),
+                "start_trade_time": _normalize_hhmm(row.get("start_trade_time")),
+                "end_trade_time": _normalize_hhmm(row.get("end_trade_time")),
+                "trading_days": str(row.get("trading_days", "")).strip(),
+                "description_override": str(row.get("description_override", "")).strip(),
+                "reason": str(row.get("reason", "")).strip(),
+            }
+        LOGGER.info("Loaded classification overrides for %s tickers", len(result))
+        return result
 
 
 def print_debug_symbol_metadata(
@@ -932,15 +1051,18 @@ def analyze_group_tickers(
 ) -> list[dict[str, Any]]:
     """Analyse tickers without allowing one failure to stop the group."""
 
-    rows: list[dict[str, Any]] = []
-    total = len(tickers)
-    for index, ticker in enumerate(tickers, start=1):
-        print(f"[{index}/{total}] Processing {ticker}...", flush=True)
-        try:
-            rows.append(processor(ticker))
-        except Exception as exc:
-            rows.append(_analysis_error_row(ticker, exc))
-    return rows
+    with timed_task("analyze_group_tickers", tickers=len(tickers)):
+        rows: list[dict[str, Any]] = []
+        total = len(tickers)
+        for index, ticker in enumerate(tickers, start=1):
+            print(f"[{index}/{total}] Processing {ticker}...", flush=True)
+            with timed_task("analyze_ticker", ticker=ticker, index=index, total=total):
+                try:
+                    rows.append(processor(ticker))
+                except Exception as exc:
+                    LOGGER.exception("Ticker analysis failed for %s", ticker)
+                    rows.append(_analysis_error_row(ticker, exc))
+        return rows
 
 
 def run_analysis_for_group(
@@ -952,47 +1074,55 @@ def run_analysis_for_group(
 ) -> Path:
     """Run signal analysis for one session group and write best-signals CSV."""
 
-    timestamp = now or datetime.now(timezone.utc)
-    timezone_info = rules_timezone(rules)
-    local_timestamp = timestamp.astimezone(timezone_info)
-    group_rule = rules["session_groups"][session_group]
-    tickers = tickers_for_group(ticker_metadata, session_group)
-    rows = analyze_group_tickers(tickers, processor=processor)
-    result = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
-    if result.empty:
-        result = pd.DataFrame(columns=[*OUTPUT_COLUMNS, "analysis_price"])
+    with timed_task("run_analysis_for_group", session_group=session_group):
+        timestamp = now or datetime.now(timezone.utc)
+        timezone_info = rules_timezone(rules)
+        local_timestamp = timestamp.astimezone(timezone_info)
+        tickers = tickers_for_group(ticker_metadata, session_group)
+        rows = analyze_group_tickers(tickers, processor=processor)
+        with timed_task("build_candidate_dataframe", session_group=session_group):
+            result = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+            if result.empty:
+                result = pd.DataFrame(columns=[*OUTPUT_COLUMNS, "analysis_price"])
 
-    tradable = result[
-        result.get("direction", pd.Series(dtype=str))
-        .astype(str)
-        .str.lower()
-        .isin({"buy", "sell"})
-    ].copy()
-    if "signal_strength" in tradable.columns:
-        tradable["signal_strength"] = pd.to_numeric(
-            tradable["signal_strength"],
-            errors="coerce",
+            tradable = result[
+                result.get("direction", pd.Series(dtype=str))
+                .astype(str)
+                .str.lower()
+                .isin({"buy", "sell"})
+            ].copy()
+            if "signal_strength" in tradable.columns:
+                tradable["signal_strength"] = pd.to_numeric(
+                    tradable["signal_strength"],
+                    errors="coerce",
+                )
+                tradable = tradable.dropna(subset=["signal_strength"]).sort_values(
+                    "signal_strength",
+                    ascending=False,
+                    kind="mergesort",
+                )
+
+            best_limit = int(rules.get("best_signal_limit", 10))
+            tradable = tradable.head(best_limit)
+            tradable["analysis_price"] = tradable.get("current_price")
+            tradable["session_group"] = session_group
+            tradable = add_metadata_columns(tradable, ticker_metadata)
+
+        output_path = candidate_output_path(session_group, local_timestamp)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with timed_task(
+            "write_candidate_csv",
+            session_group=session_group,
+            path=output_path,
+            rows=len(tradable),
+        ):
+            tradable.to_csv(output_path, index=False)
+        print(
+            f"Saved {len(tradable)} candidates for {session_group} "
+            f"to {output_path.name}.",
+            flush=True,
         )
-        tradable = tradable.dropna(subset=["signal_strength"]).sort_values(
-            "signal_strength",
-            ascending=False,
-            kind="mergesort",
-        )
-
-    best_limit = int(rules.get("best_signal_limit", 10))
-    tradable = tradable.head(best_limit)
-    tradable["analysis_price"] = tradable.get("current_price")
-    tradable["session_group"] = session_group
-    tradable = add_metadata_columns(tradable, ticker_metadata)
-
-    output_path = candidate_output_path(session_group, local_timestamp)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tradable.to_csv(output_path, index=False)
-    print(
-        f"Saved {len(tradable)} candidates for {session_group} to {output_path.name}.",
-        flush=True,
-    )
-    return output_path
+        return output_path
 
 
 def run_analysis_for_all_enabled_groups(
@@ -1002,14 +1132,16 @@ def run_analysis_for_all_enabled_groups(
 ) -> list[Path]:
     """Run analysis immediately for all enabled session groups."""
 
-    output_paths: list[Path] = []
-    for group_name, group_rule in rules.get("session_groups", {}).items():
-        if not group_rule.get("enabled", False):
-            continue
-        output_paths.append(
-            run_analysis_for_group(group_name, rules, ticker_metadata, now=now)
-        )
-    return output_paths
+    with timed_task("run_analysis_for_all_enabled_groups"):
+        output_paths: list[Path] = []
+        for group_name, group_rule in rules.get("session_groups", {}).items():
+            if not group_rule.get("enabled", False):
+                LOGGER.info("Skipping disabled session group %s", group_name)
+                continue
+            output_paths.append(
+                run_analysis_for_group(group_name, rules, ticker_metadata, now=now)
+            )
+        return output_paths
 
 
 def run_trade_plan_for_group(
@@ -1021,28 +1153,39 @@ def run_trade_plan_for_group(
 ) -> Path:
     """Generate the final trade-plan CSV for one session group."""
 
-    timestamp = now or datetime.now(timezone.utc)
-    timezone_info = rules_timezone(rules)
-    local_timestamp = timestamp.astimezone(timezone_info)
-    candidate_path = find_latest_candidate_file(session_group, local_timestamp.date())
-    candidates = pd.read_csv(candidate_path)
-    group_rule = rules["session_groups"][session_group]
-    rows = build_trade_plan_rows(
-        candidates=candidates,
-        ticker_metadata=ticker_metadata,
-        session_group=session_group,
-        group_rule=group_rule,
-        local_timestamp=local_timestamp,
-        price_loader=price_loader,
-    )
-    output_path = trade_plan_output_path(session_group, local_timestamp)
-    pd.DataFrame(rows, columns=TRADE_PLAN_COLUMNS).to_csv(output_path, index=False)
-    print(
-        f"Saved {len(rows)} trade-plan rows for {session_group} "
-        f"to {output_path.name}.",
-        flush=True,
-    )
-    return output_path
+    with timed_task("run_trade_plan_for_group", session_group=session_group):
+        timestamp = now or datetime.now(timezone.utc)
+        timezone_info = rules_timezone(rules)
+        local_timestamp = timestamp.astimezone(timezone_info)
+        candidate_path = find_latest_candidate_file(session_group, local_timestamp.date())
+        with timed_task("load_candidate_csv", path=candidate_path):
+            candidates = pd.read_csv(candidate_path)
+        group_rule = rules["session_groups"][session_group]
+        rows = build_trade_plan_rows(
+            candidates=candidates,
+            ticker_metadata=ticker_metadata,
+            session_group=session_group,
+            group_rule=group_rule,
+            local_timestamp=local_timestamp,
+            price_loader=price_loader,
+        )
+        output_path = trade_plan_output_path(session_group, local_timestamp)
+        with timed_task(
+            "write_trade_plan_csv",
+            session_group=session_group,
+            path=output_path,
+            rows=len(rows),
+        ):
+            pd.DataFrame(rows, columns=TRADE_PLAN_COLUMNS).to_csv(
+                output_path,
+                index=False,
+            )
+        print(
+            f"Saved {len(rows)} trade-plan rows for {session_group} "
+            f"to {output_path.name}.",
+            flush=True,
+        )
+        return output_path
 
 
 def build_trade_plan_rows(
@@ -1055,84 +1198,104 @@ def build_trade_plan_rows(
 ) -> list[dict[str, Any]]:
     """Build validated trade-plan rows from candidate signals."""
 
-    metadata_by_ticker = metadata_lookup(ticker_metadata)
-    rows: list[dict[str, Any]] = []
-    for _, candidate in candidates.iterrows():
-        direction = str(candidate.get("direction", "")).strip().lower()
-        if direction not in {"buy", "sell"}:
-            continue
-
-        ticker = str(candidate.get("ticker", "")).strip()
-        if not ticker:
-            continue
-
-        try:
-            entry_price = price_loader(ticker)
-            entry_value = _to_float(entry_price)
-            if entry_value is None or entry_value <= 0:
-                continue
-            analysis_price = _to_float(
-                candidate.get("analysis_price", candidate.get("current_price"))
-            )
-            atr_percent = _to_float(candidate.get("atr_percent_1d"))
-            if analysis_price is None or atr_percent is None:
-                continue
-            allowed, validation_reason, drift, _ = is_entry_price_still_valid(
-                analysis_price=analysis_price,
-                entry_price=entry_value,
-                atr_percent_1d=atr_percent,
-                direction=direction,
-            )
-            if not allowed:
+    with timed_task(
+        "build_trade_plan_rows",
+        session_group=session_group,
+        candidates=len(candidates),
+    ):
+        metadata_by_ticker = metadata_lookup(ticker_metadata)
+        rows: list[dict[str, Any]] = []
+        for _, candidate in candidates.iterrows():
+            direction = str(candidate.get("direction", "")).strip().lower()
+            if direction not in {"buy", "sell"}:
+                LOGGER.info("Skipping neutral/non-tradable candidate direction=%s", direction)
                 continue
 
-            atr_1d = _to_float(candidate.get("atr_1d"))
-            signal_strength = _to_float(candidate.get("signal_strength")) or 0.0
-            sl_tp = calculate_daily_sl_tp(
-                current_price=entry_value,
-                direction=direction,
-                signal_strength=signal_strength,
-                atr_1d=atr_1d or 0.0,
-                sl_multiplier=float(group_rule["sl_multiplier"]),
-                tp_base_multiplier=float(group_rule["tp_base_multiplier"]),
-                tp_strength_multiplier=float(group_rule["tp_strength_multiplier"]),
-            )
-            if sl_tp["stop_loss"] is None or sl_tp["take_profit"] is None:
+            ticker = str(candidate.get("ticker", "")).strip()
+            if not ticker:
+                LOGGER.info("Skipping candidate with missing ticker")
                 continue
 
-            metadata = metadata_by_ticker.get(ticker, {})
-            close_time_local = build_local_time_text(
-                local_timestamp.date(),
-                str(group_rule["close_time"]),
-            )
-            reason = f"{validation_reason}; {candidate.get('reason', '')}"[:500]
-            row = {
-                "Ticker name": ticker,
-                "current price": smart_round_price(entry_value),
-                "direction of trading": direction,
-                "Stop Loss level": sl_tp["stop_loss"],
-                "Take Profit level": sl_tp["take_profit"],
-                "ticker": ticker,
-                "description": metadata.get("description", ""),
-                "session_group": session_group,
-                "entry_time_local": local_timestamp.strftime("%Y-%m-%d %H:%M"),
-                "close_time_local": close_time_local,
-                "entry_price": smart_round_price(entry_value),
-                "direction": direction,
-                "signal_strength": signal_strength,
-                "stop_loss": sl_tp["stop_loss"],
-                "take_profit": sl_tp["take_profit"],
-                "risk_reward_ratio": sl_tp["risk_reward_ratio"],
-                "analysis_price": smart_round_price(analysis_price),
-                "price_drift_percent": round(drift * 100.0, 4),
-                "entry_validation_result": "valid",
-                "reason": reason,
-            }
-            rows.append(row)
-        except Exception as exc:
-            print(f"WARNING: skipped {ticker} at entry validation: {exc}", flush=True)
-            continue
-    return rows
+            try:
+                with timed_task("fetch_entry_price", ticker=ticker):
+                    entry_price = price_loader(ticker)
+                entry_value = _to_float(entry_price)
+                if entry_value is None or entry_value <= 0:
+                    LOGGER.info("Skipping %s because entry price is invalid", ticker)
+                    continue
+                analysis_price = _to_float(
+                    candidate.get("analysis_price", candidate.get("current_price"))
+                )
+                atr_percent = _to_float(candidate.get("atr_percent_1d"))
+                if analysis_price is None or atr_percent is None:
+                    LOGGER.info(
+                        "Skipping %s because analysis price or ATR percent is missing",
+                        ticker,
+                    )
+                    continue
+                with timed_task("validate_entry_price", ticker=ticker):
+                    allowed, validation_reason, drift, _ = is_entry_price_still_valid(
+                        analysis_price=analysis_price,
+                        entry_price=entry_value,
+                        atr_percent_1d=atr_percent,
+                        direction=direction,
+                    )
+                if not allowed:
+                    LOGGER.info("Skipping %s: %s", ticker, validation_reason)
+                    continue
+
+                atr_1d = _to_float(candidate.get("atr_1d"))
+                signal_strength = _to_float(candidate.get("signal_strength")) or 0.0
+                with timed_task("calculate_entry_sl_tp", ticker=ticker):
+                    sl_tp = calculate_daily_sl_tp(
+                        current_price=entry_value,
+                        direction=direction,
+                        signal_strength=signal_strength,
+                        atr_1d=atr_1d or 0.0,
+                        sl_multiplier=float(group_rule["sl_multiplier"]),
+                        tp_base_multiplier=float(group_rule["tp_base_multiplier"]),
+                        tp_strength_multiplier=float(
+                            group_rule["tp_strength_multiplier"]
+                        ),
+                    )
+                if sl_tp["stop_loss"] is None or sl_tp["take_profit"] is None:
+                    LOGGER.info("Skipping %s because SL/TP calculation failed", ticker)
+                    continue
+
+                metadata = metadata_by_ticker.get(ticker, {})
+                close_time_local = build_local_time_text(
+                    local_timestamp.date(),
+                    str(group_rule["close_time"]),
+                )
+                reason = f"{validation_reason}; {candidate.get('reason', '')}"[:500]
+                row = {
+                    "Ticker name": ticker,
+                    "current price": smart_round_price(entry_value),
+                    "direction of trading": direction,
+                    "Stop Loss level": sl_tp["stop_loss"],
+                    "Take Profit level": sl_tp["take_profit"],
+                    "ticker": ticker,
+                    "description": metadata.get("description", ""),
+                    "session_group": session_group,
+                    "entry_time_local": local_timestamp.strftime("%Y-%m-%d %H:%M"),
+                    "close_time_local": close_time_local,
+                    "entry_price": smart_round_price(entry_value),
+                    "direction": direction,
+                    "signal_strength": signal_strength,
+                    "stop_loss": sl_tp["stop_loss"],
+                    "take_profit": sl_tp["take_profit"],
+                    "risk_reward_ratio": sl_tp["risk_reward_ratio"],
+                    "analysis_price": smart_round_price(analysis_price),
+                    "price_drift_percent": round(drift * 100.0, 4),
+                    "entry_validation_result": "valid",
+                    "reason": reason,
+                }
+                rows.append(row)
+            except Exception as exc:
+                LOGGER.exception("Entry validation failed for %s", ticker)
+                print(f"WARNING: skipped {ticker} at entry validation: {exc}", flush=True)
+                continue
+        return rows
 
 
 def add_metadata_columns(
@@ -1177,9 +1340,11 @@ def read_ticker_trading_times() -> pd.DataFrame:
     """Read ticker trading metadata CSV if available."""
 
     path = ticker_trading_times_path()
-    if not path.exists():
-        return pd.DataFrame(columns=METADATA_COLUMNS)
-    return pd.read_csv(path)
+    with timed_task("read_ticker_trading_times", path=path):
+        if not path.exists():
+            LOGGER.info("Ticker metadata CSV does not exist at %s", path)
+            return pd.DataFrame(columns=METADATA_COLUMNS)
+        return pd.read_csv(path)
 
 
 def candidate_output_path(session_group: str, local_timestamp: datetime) -> Path:
@@ -1259,17 +1424,19 @@ def execute_due_event(
 ) -> None:
     """Execute one due scheduler event."""
 
-    utc_timestamp = local_timestamp.astimezone(timezone.utc)
-    if event_type == "analysis":
-        run_analysis_for_group(group_name, rules, ticker_metadata, now=utc_timestamp)
-    elif event_type == "open":
-        run_trade_plan_for_group(group_name, rules, ticker_metadata, now=utc_timestamp)
-    elif event_type == "close":
-        print(
-            f"Close event reached for {group_name} at "
-            f"{local_timestamp:%Y-%m-%d %H:%M}. No order action is taken.",
-            flush=True,
-        )
+    with timed_task("execute_due_event", group=group_name, event_type=event_type):
+        utc_timestamp = local_timestamp.astimezone(timezone.utc)
+        if event_type == "analysis":
+            run_analysis_for_group(group_name, rules, ticker_metadata, now=utc_timestamp)
+        elif event_type == "open":
+            run_trade_plan_for_group(group_name, rules, ticker_metadata, now=utc_timestamp)
+        elif event_type == "close":
+            print(
+                f"Close event reached for {group_name} at "
+                f"{local_timestamp:%Y-%m-%d %H:%M}. No order action is taken.",
+                flush=True,
+            )
+            LOGGER.info("Close event reached for %s; no order action taken", group_name)
 
 
 def print_status(
@@ -1451,12 +1618,18 @@ def main() -> None:
         return
     if args.command == UPDATE_COMMAND:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        update_ticker_trading_times(debug_symbol=args.debug_symbol)
+        log_path = setup_logging()
+        print(f"Logging to {log_path}", flush=True)
+        with timed_task("one_shot_update_command"):
+            update_ticker_trading_times(debug_symbol=args.debug_symbol)
         return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = setup_logging()
     print("Starting trade_signal_generator.py...", flush=True)
     print(f"CSV output directory: {OUTPUT_DIR}", flush=True)
+    print(f"Log file: {log_path}", flush=True)
+    LOGGER.info("Starting trade_signal_generator.py")
 
     commands: queue.Queue[str] = queue.Queue()
     threading.Thread(target=console_listener, args=(commands,), daemon=True).start()
@@ -1466,8 +1639,9 @@ def main() -> None:
     )
 
     print("Loading session rules...", flush=True)
-    rules = load_session_rules()
-    last_rules_mtime = rules_mtime()
+    with timed_task("startup_load_session_rules"):
+        rules = load_session_rules()
+        last_rules_mtime = rules_mtime()
     print(f"Session rules loaded from {session_rules_path()}.", flush=True)
 
     print(
@@ -1475,19 +1649,16 @@ def main() -> None:
         "after this step finishes.",
         flush=True,
     )
-    ticker_metadata = _safe_update_or_read_metadata()
+    with timed_task("startup_metadata_refresh"):
+        ticker_metadata = _safe_update_or_read_metadata()
     print(
         f"Startup metadata ready: {len(ticker_metadata)} tickers loaded.",
         flush=True,
     )
     executed_events: set[str] = set()
 
-    print(
-        "trade_signal_generator.py is ready. "
-        f"Commands: {TRIGGER_COMMAND}, {UPDATE_COMMAND}, {RELOAD_COMMAND}, "
-        f"{STATUS_COMMAND}, {QUIT_COMMAND}.",
-        flush=True,
-    )
+    print("trade_signal_generator.py is ready.", flush=True)
+    print_console_ready()
 
     while True:
         timeout = min(60, int(rules.get("rules_reload_interval_seconds", 60)))
@@ -1498,30 +1669,41 @@ def main() -> None:
 
         if command is not None:
             normalized_command = command.strip().lower()
-            if normalized_command in {QUIT_COMMAND, LEGACY_EXIT_COMMAND}:
-                print("Stopping trade_signal_generator.py.", flush=True)
-                return
-            if normalized_command == TRIGGER_COMMAND:
-                run_analysis_for_all_enabled_groups(rules, ticker_metadata)
-            elif normalized_command == UPDATE_COMMAND:
-                try:
-                    ticker_metadata = update_ticker_trading_times()
-                except Exception as exc:
-                    print(f"ERROR updating ticker metadata: {exc}", flush=True)
-            elif normalized_command == RELOAD_COMMAND:
-                rules = load_session_rules(previous_rules=rules)
-                last_rules_mtime = rules_mtime()
-                print("Reloaded session rules.", flush=True)
-            elif normalized_command == STATUS_COMMAND:
-                print_status(rules, ticker_metadata, executed_events)
-            else:
-                print("unknown command", flush=True)
+            with timed_task("handle_console_command", command=normalized_command):
+                if normalized_command in {QUIT_COMMAND, LEGACY_EXIT_COMMAND}:
+                    print("Stopping trade_signal_generator.py.", flush=True)
+                    LOGGER.info("Stopping scheduler after console command")
+                    return
+                if normalized_command == TRIGGER_COMMAND:
+                    try:
+                        run_analysis_for_all_enabled_groups(rules, ticker_metadata)
+                    except Exception as exc:
+                        LOGGER.exception("Immediate analysis command failed")
+                        print(f"ERROR running immediate analysis: {exc}", flush=True)
+                elif normalized_command == UPDATE_COMMAND:
+                    try:
+                        ticker_metadata = update_ticker_trading_times()
+                    except Exception as exc:
+                        LOGGER.exception("Ticker metadata update command failed")
+                        print(f"ERROR updating ticker metadata: {exc}", flush=True)
+                elif normalized_command == RELOAD_COMMAND:
+                    rules = load_session_rules(previous_rules=rules)
+                    last_rules_mtime = rules_mtime()
+                    print("Reloaded session rules.", flush=True)
+                elif normalized_command == STATUS_COMMAND:
+                    print_status(rules, ticker_metadata, executed_events)
+                else:
+                    print("unknown command", flush=True)
+            print_console_ready()
 
         current_mtime = rules_mtime()
+        action_completed = False
         if current_mtime is not None and current_mtime != last_rules_mtime:
-            rules = load_session_rules(previous_rules=rules)
-            last_rules_mtime = current_mtime
+            with timed_task("auto_reload_changed_session_rules"):
+                rules = load_session_rules(previous_rules=rules)
+                last_rules_mtime = current_mtime
             print("Reloaded changed session rules.", flush=True)
+            action_completed = True
 
         timezone_info = rules_timezone(rules)
         local_timestamp = datetime.now(timezone_info).replace(second=0, microsecond=0)
@@ -1540,16 +1722,26 @@ def main() -> None:
                     local_timestamp,
                 )
             except Exception as exc:
+                LOGGER.exception("Scheduled event failed")
                 print(f"ERROR running {event_type} for {group_name}: {exc}", flush=True)
             executed_events.add(event_key)
+            action_completed = True
+
+        if action_completed:
+            print_console_ready()
 
 
 def _safe_update_or_read_metadata() -> pd.DataFrame:
-    try:
-        return update_ticker_trading_times()
-    except Exception as exc:
-        print(f"WARNING: could not update ticker metadata on startup: {exc}", flush=True)
-        return read_ticker_trading_times()
+    with timed_task("safe_update_or_read_metadata"):
+        try:
+            return update_ticker_trading_times()
+        except Exception as exc:
+            LOGGER.exception("Startup metadata update failed; reading existing CSV")
+            print(
+                f"WARNING: could not update ticker metadata on startup: {exc}",
+                flush=True,
+            )
+            return read_ticker_trading_times()
 
 
 def adjusted_open_event_time(open_time: str, minutes_before_open: int) -> str:
