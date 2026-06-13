@@ -187,7 +187,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
         },
         "us_stock_index": {
             "enabled": True,
-            "analysis_time": "14:50",
+            "analysis_time": "14:40",
             "open_time": "15:45",
             "close_time": "21:45",
             "trading_days": "mon-fri",
