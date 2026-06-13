@@ -96,6 +96,41 @@ class MT5InstrumentProvider(MT5BaseProvider, InstrumentProvider):
 
         return sorted(unique_symbols.values(), key=lambda value: value.upper())
 
+    def find_instrument_metadata(self) -> list[dict[str, Any]]:
+        """Return tradable MT5 symbols with best-effort metadata."""
+
+        client = self._get_client()
+        symbols = client.symbols_get()
+        if not symbols:
+            raise DataProviderError(
+                "MT5 returned no symbols. Last error: " f"{_last_error(client)}"
+            )
+
+        metadata_rows: list[dict[str, Any]] = []
+        for symbol_info in symbols:
+            name = _symbol_name(symbol_info)
+            if not name or not _is_tradable(symbol_info):
+                continue
+            metadata = _symbol_info_to_dict(symbol_info)
+            if hasattr(client, "symbol_select"):
+                try:
+                    client.symbol_select(name, True)
+                except Exception:
+                    pass
+            if hasattr(client, "symbol_info"):
+                try:
+                    selected_info = client.symbol_info(name)
+                    if selected_info is not None:
+                        metadata.update(_symbol_info_to_dict(selected_info))
+                except Exception:
+                    pass
+            metadata["name"] = name
+            metadata_rows.append(metadata)
+
+        if not metadata_rows:
+            raise DataProviderError("MT5 returned symbols, but none were tradable.")
+        return metadata_rows
+
 
 class MT5MarketDataProvider(MT5BaseProvider, MarketDataProvider):
     """Load historical OHLCV candles from MetaTrader 5."""
@@ -125,6 +160,40 @@ class MT5MarketDataProvider(MT5BaseProvider, MarketDataProvider):
                 f"from {request.begin_time} to {request.end_time}."
             )
         return data
+
+    def get_current_price(self, symbol: str, side: str | None = None) -> float:
+        """Return the latest usable MT5 tick price for a symbol.
+
+        Args:
+            symbol: MT5 symbol name or normalized symbol alias.
+            side: Optional trade side. For ``buy`` the ask price is preferred;
+                for ``sell`` the bid price is preferred. Without a side, the
+                latest trade price is preferred, then the bid/ask midpoint.
+
+        Raises:
+            DataProviderError: If MT5 cannot resolve the symbol or returns no
+                usable bid, ask, or last price.
+        """
+
+        client = self._get_client()
+        symbol_name = self._resolve_symbol_name(client, symbol)
+        self._select_symbol(client, symbol_name)
+        if not hasattr(client, "symbol_info_tick"):
+            raise DataProviderError("MT5 client does not expose symbol_info_tick().")
+
+        tick = client.symbol_info_tick(symbol_name)
+        if tick is None:
+            raise DataProviderError(
+                f"MT5 returned no tick for {symbol_name}. "
+                f"Last error: {_last_error(client)}"
+            )
+
+        price = _select_tick_price(_symbol_info_to_dict(tick), side)
+        if price is None:
+            raise DataProviderError(
+                f"MT5 tick for {symbol_name} has no positive bid, ask, or last price."
+            )
+        return price
 
     def _resolve_symbol_name(self, client: Any, requested_symbol: str) -> str:
         symbols = client.symbols_get()
@@ -276,6 +345,59 @@ def _symbol_name(symbol_info: Any) -> str:
     if isinstance(symbol_info, dict):
         return str(symbol_info.get("name", "")).strip()
     return str(getattr(symbol_info, "name", "")).strip()
+
+
+def _symbol_info_to_dict(symbol_info: Any) -> dict[str, Any]:
+    if symbol_info is None:
+        return {}
+    if isinstance(symbol_info, dict):
+        return dict(symbol_info)
+    if hasattr(symbol_info, "_asdict"):
+        return dict(symbol_info._asdict())
+
+    values: dict[str, Any] = {}
+    for name in dir(symbol_info):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(symbol_info, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        if isinstance(value, (str, int, float, bool, type(None))):
+                values[name] = value
+    return values
+
+
+def _select_tick_price(tick: dict[str, Any], side: str | None = None) -> float | None:
+    bid = _positive_float(tick.get("bid"))
+    ask = _positive_float(tick.get("ask"))
+    last = _positive_float(tick.get("last"))
+    midpoint = (bid + ask) / 2.0 if bid is not None and ask is not None else None
+    normalized_side = str(side or "").strip().lower()
+
+    if normalized_side in {"buy", "long"}:
+        candidates = (ask, last, midpoint, bid)
+    elif normalized_side in {"sell", "short"}:
+        candidates = (bid, last, midpoint, ask)
+    else:
+        candidates = (last, midpoint, bid, ask)
+
+    for candidate in candidates:
+        if candidate is not None and candidate > 0:
+            return float(candidate)
+    return None
+
+
+def _positive_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(numeric) or numeric <= 0:
+        return None
+    return numeric
 
 
 def _is_tradable(symbol_info: Any) -> bool:

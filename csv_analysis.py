@@ -15,6 +15,7 @@ from typing import Callable
 import pandas as pd
 
 from investment_adviser import load_symbol_data
+from investment_adviser.providers.mt5 import MT5MarketDataProvider
 from find_signal import (
     calculate_atr14,
     calculate_daily_sl_tp,
@@ -35,6 +36,7 @@ SL_TP_COLUMNS = [
     "risk_reward_ratio",
     "sl_tp_reason",
 ]
+_LIVE_PRICE_PROVIDER = MT5MarketDataProvider()
 
 
 def find_best_signals(
@@ -89,12 +91,14 @@ def enrich_with_current_prices(
         enriched.insert(loc=1, column="current_price", value=None)
 
     for index, row in enriched.iterrows():
-        current_price = _to_float(row.get("current_price"))
+        existing_price = _to_float(row.get("current_price"))
+        current_price = get_current_price(
+            str(row["ticker"]),
+            price_loader=price_loader,
+            side=str(row.get("direction", "")),
+        )
         if current_price is None or current_price <= 0:
-            current_price = get_current_price(
-                str(row["ticker"]),
-                price_loader=price_loader,
-            )
+            current_price = existing_price
         enriched.at[index, "current_price"] = current_price
 
     current_price = enriched.pop("current_price")
@@ -137,13 +141,20 @@ def enrich_with_sl_tp(
 def get_current_price(
     ticker: str,
     price_loader: Callable[..., pd.DataFrame] = load_symbol_data,
+    side: str | None = None,
 ) -> float | None:
-    """Return latest available close price for a ticker.
+    """Return the latest available current price for a ticker.
 
-    Public providers do not guarantee a live quote endpoint for every symbol,
-    so this uses the latest available close. It tries recent 1H candles first
-    and falls back to recent 1D candles.
+    MT5 tick data is preferred because candle closes can remain unchanged until
+    the next candle completes. If a live tick is unavailable, the function falls
+    back to recent candle closes so CSV generation can continue.
     """
+
+    try:
+        live_price = _LIVE_PRICE_PROVIDER.get_current_price(ticker, side=side)
+        return smart_round_price(float(live_price))
+    except Exception:
+        pass
 
     now = datetime.now(timezone.utc)
     attempts = [

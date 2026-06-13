@@ -1,3 +1,4 @@
+from collections import namedtuple
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -113,6 +114,34 @@ def test_mt5_market_data_provider_normalizes_rates():
     assert len(data) == 2
     assert data.loc[0, "volume"] == 100
     assert data["timestamp"].dt.tz is not None
+
+
+def test_mt5_current_price_uses_live_tick_side_prices():
+    Tick = namedtuple("Tick", ["bid", "ask", "last"])
+
+    class FakeSymbol:
+        name = "EURUSD"
+        trade_mode = 1
+
+    class FakeClient:
+        def initialize(self):
+            return True
+
+        def symbols_get(self):
+            return [FakeSymbol()]
+
+        def symbol_select(self, symbol, selected):
+            return symbol == "EURUSD" and selected
+
+        def symbol_info_tick(self, symbol):
+            assert symbol == "EURUSD"
+            return Tick(bid=1.10, ask=1.12, last=0.0)
+
+    provider = MT5MarketDataProvider(client_factory=FakeClient)
+
+    assert provider.get_current_price("EURUSD", side="buy") == 1.12
+    assert provider.get_current_price("EURUSD", side="sell") == 1.10
+    assert provider.get_current_price("EURUSD") == pytest.approx(1.11)
 
 
 def test_load_symbol_data_rejects_invalid_timeframe():

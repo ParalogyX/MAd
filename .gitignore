@@ -2,3 +2,6 @@
 __pycache__/
 *.csv
 data/
+*.json
+*.log
+notes

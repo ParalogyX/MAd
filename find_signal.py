@@ -8,11 +8,14 @@ entry/stop/take-profit instructions.
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import re
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
 
 import pandas as pd
@@ -27,6 +30,9 @@ from investment_adviser import (
 
 STRATEGY_NAME = "Multi-Timeframe Trend Momentum Consensus Signal"
 OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
+LOGGER = logging.getLogger("trade_signal_generator")
+LOGGER.addHandler(logging.NullHandler())
+LOGGER.propagate = False
 OUTPUT_COLUMNS = [
     "ticker",
     "current_price",
@@ -435,12 +441,15 @@ def calculate_daily_sl_tp(
     direction: str,
     signal_strength: float,
     atr_1d: float,
+    sl_multiplier: float = 0.45,
+    tp_base_multiplier: float = 0.60,
+    tp_strength_multiplier: float = 0.25,
 ) -> dict[str, Any]:
     """Calculate stop-loss and take-profit levels for daily signals.
 
     This function does not place trades. It only returns calculated levels.
-    Stop-loss distance is volatility-based and is not widened by signal
-    strength; signal strength only slightly adjusts take-profit distance.
+    The current_price argument is the price used for the calculated levels.
+    Session-specific multipliers can override the defaults.
     """
 
     atr_value = _to_float(atr_1d)
@@ -474,9 +483,10 @@ def calculate_daily_sl_tp(
     )
     usable_atr_1d = price_value * usable_atr_percent
 
-    sl_multiplier = 0.45
     sl_distance = sl_multiplier * usable_atr_1d
-    tp_multiplier = 0.60 + 0.25 * (strength_value / 100.0)
+    tp_multiplier = tp_base_multiplier + tp_strength_multiplier * (
+        strength_value / 100.0
+    )
     tp_distance = tp_multiplier * usable_atr_1d
     risk_reward_ratio = tp_distance / sl_distance
 
@@ -610,26 +620,32 @@ def process_symbol(
         h4_begin = timestamp - timedelta(days=240)
         h1_begin = timestamp - timedelta(days=60)
 
-        data_1d = normalize_ohlcv_columns(
-            data_loader(symbol, "1d", daily_begin, timestamp, provider="fallback")
-        )
-        data_4h = normalize_ohlcv_columns(
-            data_loader(symbol, "4h", h4_begin, timestamp, provider="fallback")
-        )
-        data_1h = normalize_ohlcv_columns(
-            data_loader(symbol, "1h", h1_begin, timestamp, provider="fallback")
-        )
+        with _timed_log_task("load_symbol_data", symbol=symbol, timeframe="1d"):
+            data_1d = normalize_ohlcv_columns(
+                data_loader(symbol, "1d", daily_begin, timestamp, provider="fallback")
+            )
+        with _timed_log_task("load_symbol_data", symbol=symbol, timeframe="4h"):
+            data_4h = normalize_ohlcv_columns(
+                data_loader(symbol, "4h", h4_begin, timestamp, provider="fallback")
+            )
+        with _timed_log_task("load_symbol_data", symbol=symbol, timeframe="1h"):
+            data_1h = normalize_ohlcv_columns(
+                data_loader(symbol, "1h", h1_begin, timestamp, provider="fallback")
+            )
 
         validate_minimum_length(data_1d, MIN_DAILY_CANDLES, "1D")
         validate_minimum_length(data_4h, MIN_H4_CANDLES, "4H")
         validate_minimum_length(data_1h, MIN_H1_CANDLES, "1H")
 
-        ta_1d = technical_analyzer(data_1d)
-        ta_4h = technical_analyzer(data_4h)
-        ta_1h = technical_analyzer(data_1h)
-        indicators_1d = ensure_indicators(data_1d, ta_1d)
-        indicators_4h = ensure_indicators(data_4h, ta_4h)
-        indicators_1h = ensure_indicators(data_1h, ta_1h)
+        with _timed_log_task("technical_analysis", symbol=symbol, timeframe="1d"):
+            ta_1d = technical_analyzer(data_1d)
+            indicators_1d = ensure_indicators(data_1d, ta_1d)
+        with _timed_log_task("technical_analysis", symbol=symbol, timeframe="4h"):
+            ta_4h = technical_analyzer(data_4h)
+            indicators_4h = ensure_indicators(data_4h, ta_4h)
+        with _timed_log_task("technical_analysis", symbol=symbol, timeframe="1h"):
+            ta_1h = technical_analyzer(data_1h)
+            indicators_1h = ensure_indicators(data_1h, ta_1h)
 
         daily_long, daily_short = calculate_daily_trend_scores(
             data_1d,
@@ -651,15 +667,17 @@ def process_symbol(
         adx_score = calculate_adx_score(indicators_4h["adx14"])
 
         try:
-            candle_result = candle_analyzer(data_4h)
-            candle_long, candle_short = calculate_candle_scores(
-                candle_result,
-                data_4h,
-            )
+            with _timed_log_task("candle_analysis", symbol=symbol, timeframe="4h"):
+                candle_result = candle_analyzer(data_4h)
+                candle_long, candle_short = calculate_candle_scores(
+                    candle_result,
+                    data_4h,
+                )
         except Exception:
             candle_long, candle_short = 50.0, 50.0
 
-        raw_sentiment = extract_sentiment_score(sentiment_analyzer, symbol)
+        with _timed_log_task("sentiment_analysis", symbol=symbol):
+            raw_sentiment = extract_sentiment_score(sentiment_analyzer, symbol)
         sentiment_long, sentiment_short = calculate_sentiment_scores(raw_sentiment)
 
         final_long = (
@@ -1250,6 +1268,28 @@ def _normalize_key(value: str) -> str:
 
 def _normalize_pattern(value: str) -> str:
     return re.sub(r"[\s_-]+", " ", value.strip().lower())
+
+
+@contextmanager
+def _timed_log_task(task_name: str, **context: Any):
+    """Log elapsed time for signal-analysis internals when logging is configured."""
+
+    context_text = ""
+    if context:
+        context_text = " [" + ", ".join(
+            f"{key}={value}" for key, value in context.items()
+        ) + "]"
+    LOGGER.info("START %s%s", task_name, context_text)
+    started_at = perf_counter()
+    try:
+        yield
+    except Exception:
+        elapsed = perf_counter() - started_at
+        LOGGER.exception("FAILED %s after %.3fs%s", task_name, elapsed, context_text)
+        raise
+    else:
+        elapsed = perf_counter() - started_at
+        LOGGER.info("DONE %s in %.3fs%s", task_name, elapsed, context_text)
 
 
 if __name__ == "__main__":
