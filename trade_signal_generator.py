@@ -32,17 +32,43 @@ from find_signal import (
     process_symbol,
     smart_round_price,
 )
-from investment_adviser.providers.mt5 import MT5InstrumentProvider
+from investment_adviser.config import (
+    MT5_DEFAULT_HOST,
+    MT5_DEFAULT_MAX_BARS,
+    MT5_DEFAULT_PORT,
+)
+from investment_adviser.providers.mt5 import (
+    MT5InstrumentProvider,
+    configure_mt5_connection,
+)
+from runtime_paths import (
+    best_signals_dir,
+    ensure_runtime_directories,
+    logs_dir,
+    output_root,
+    trade_plans_dir,
+)
 import ticker_classification_rules as classification_rules
 
+
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
-OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
-OUTPUT_DIR = Path(os.getenv(OUTPUT_DIR_ENV_VAR, str(PROJECT_ROOT))).expanduser()
+OUTPUT_DIR = output_root(PROJECT_ROOT)
 SESSION_RULES_FILE = "session_rules.json"
 TICKER_TRADING_TIMES_FILE = "ticker_trading_times.csv"
 MT5_SYMBOL_SESSIONS_FILE = "mt5_symbol_sessions.csv"
 CLASSIFICATION_OVERRIDES_FILE = "ticker_classification_overrides.csv"
-LOG_FILE = "trade_signal_generator.log"
+LOG_PREFIX = "trade_signal_generator"
+LOG_RETENTION_DAYS = 30
 TRIGGER_COMMAND = "now"
 UPDATE_COMMAND = "update"
 RELOAD_COMMAND = "reload"
@@ -55,8 +81,13 @@ LOGGER = logging.getLogger("trade_signal_generator")
 LOGGER.addHandler(logging.NullHandler())
 LOGGER.propagate = False
 _LOGGING_CONFIGURED = False
+_LOG_HANDLER: logging.FileHandler | None = None
+_LOG_DATE: date | None = None
 
 DEFAULT_TIMEZONE = "Europe/Amsterdam"
+DEFAULT_MT5_HOST = os.getenv("MT5_HOST", MT5_DEFAULT_HOST)
+DEFAULT_MT5_PORT = _env_int("MT5_PORT", MT5_DEFAULT_PORT)
+DEFAULT_MT5_MAX_BARS = _env_int("MT5_MAX_BARS", MT5_DEFAULT_MAX_BARS)
 METADATA_COLUMNS = [
     "ticker",
     "description",
@@ -101,6 +132,11 @@ TRADE_PLAN_COLUMNS = [
 
 DEFAULT_SESSION_RULES: dict[str, Any] = {
     "timezone": DEFAULT_TIMEZONE,
+    "mt5": {
+        "host": DEFAULT_MT5_HOST,
+        "port": DEFAULT_MT5_PORT,
+        "max_bars": DEFAULT_MT5_MAX_BARS,
+    },
     "best_signal_limit": 10,
     "entry_check_minutes_before_open": 0,
     "rules_reload_interval_seconds": 60,
@@ -233,12 +269,32 @@ def setup_logging() -> Path:
     """Configure file logging for scheduler timings and operational events."""
 
     global _LOGGING_CONFIGURED
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = OUTPUT_DIR / LOG_FILE
+    ensure_runtime_directories(OUTPUT_DIR)
     if _LOGGING_CONFIGURED:
-        return log_path
+        return ensure_daily_logging()
 
     LOGGER.setLevel(logging.INFO)
+    _LOGGING_CONFIGURED = True
+    log_path = ensure_daily_logging()
+    LOGGER.propagate = False
+    LOGGER.info("Logging initialized at %s", log_path)
+    return log_path
+
+
+def ensure_daily_logging() -> Path:
+    """Ensure the logger writes to today's dated log file."""
+
+    global _LOG_HANDLER, _LOG_DATE
+    today = datetime.now().date()
+    log_path = log_file_path(today)
+    if _LOG_HANDLER is not None and _LOG_DATE == today:
+        return log_path
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if _LOG_HANDLER is not None:
+        LOGGER.removeHandler(_LOG_HANDLER)
+        _LOG_HANDLER.close()
+
     handler = logging.FileHandler(log_path, encoding="utf-8")
     handler.setFormatter(
         logging.Formatter(
@@ -247,16 +303,37 @@ def setup_logging() -> Path:
         )
     )
     LOGGER.addHandler(handler)
-    LOGGER.propagate = False
-    _LOGGING_CONFIGURED = True
-    LOGGER.info("Logging initialized at %s", log_path)
+    _LOG_HANDLER = handler
+    _LOG_DATE = today
+    cleanup_old_logs()
     return log_path
+
+
+def log_file_path(log_date: date | None = None) -> Path:
+    """Return the dated scheduler log path for a date."""
+
+    selected_date = log_date or datetime.now().date()
+    return logs_dir(OUTPUT_DIR) / f"{LOG_PREFIX}_{selected_date:%Y-%m-%d}.log"
+
+
+def cleanup_old_logs(retention_days: int = LOG_RETENTION_DAYS) -> None:
+    """Delete log files older than the retention window."""
+
+    cutoff = datetime.now().timestamp() - retention_days * 24 * 60 * 60
+    for path in logs_dir(OUTPUT_DIR).glob("*.log"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
 
 
 @contextmanager
 def timed_task(task_name: str, **context: Any):
     """Log task start, success/failure, and elapsed time."""
 
+    if _LOGGING_CONFIGURED:
+        ensure_daily_logging()
     context_text = _format_log_context(context)
     LOGGER.info("START %s%s", task_name, context_text)
     started_at = perf_counter()
@@ -388,6 +465,13 @@ def ensure_session_rules_file(path: Path | None = None) -> Path:
 def session_rules_need_migration(existing_rules: dict[str, Any]) -> bool:
     """Return True when the editable rules file is missing default keys."""
 
+    mt5_rules = existing_rules.get("mt5")
+    if not isinstance(mt5_rules, dict):
+        return True
+    for key in DEFAULT_SESSION_RULES["mt5"]:
+        if key not in mt5_rules:
+            return True
+
     existing_groups = existing_rules.get("session_groups", {})
     if not isinstance(existing_groups, dict):
         return True
@@ -425,14 +509,19 @@ def load_session_rules(
                     f"WARNING: invalid {rules_path.name}; keeping last valid rules: {exc}",
                     flush=True,
                 )
+                apply_mt5_settings_from_rules(previous_rules)
                 return previous_rules
             print(
                 f"WARNING: invalid {rules_path.name}; using built-in defaults: {exc}",
                 flush=True,
             )
-            return copy.deepcopy(DEFAULT_SESSION_RULES)
+            rules = copy.deepcopy(DEFAULT_SESSION_RULES)
+            apply_mt5_settings_from_rules(rules)
+            return rules
 
-        return merge_session_rules(raw_rules)
+        rules = merge_session_rules(raw_rules)
+        apply_mt5_settings_from_rules(rules)
+        return rules
 
 
 def merge_session_rules(raw_rules: dict[str, Any]) -> dict[str, Any]:
@@ -451,6 +540,10 @@ def merge_session_rules(raw_rules: dict[str, Any]) -> dict[str, Any]:
         if key in raw_rules:
             merged[key] = raw_rules[key]
 
+    raw_mt5 = raw_rules.get("mt5")
+    if isinstance(raw_mt5, dict):
+        merged["mt5"].update(raw_mt5)
+
     raw_groups = raw_rules.get("session_groups")
     if isinstance(raw_groups, dict):
         for group_name, group_rule in raw_groups.items():
@@ -465,6 +558,25 @@ def merge_session_rules(raw_rules: dict[str, Any]) -> dict[str, Any]:
             base_rule.update(group_rule)
             merged["session_groups"][group_name] = base_rule
     return merged
+
+
+def apply_mt5_settings_from_rules(rules: dict[str, Any]) -> None:
+    """Apply editable MT5 host/port settings to all MT5 providers."""
+
+    mt5_rules = rules.get("mt5", {})
+    if not isinstance(mt5_rules, dict):
+        mt5_rules = {}
+    host = str(mt5_rules.get("host") or DEFAULT_MT5_HOST).strip()
+    port = _safe_int(mt5_rules.get("port"), DEFAULT_MT5_PORT)
+    max_bars = _safe_int(mt5_rules.get("max_bars"), DEFAULT_MT5_MAX_BARS)
+    configure_mt5_connection(host=host, port=port, max_bars=max_bars)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def rules_mtime(path: Path | None = None) -> float | None:
@@ -1211,6 +1323,7 @@ def run_trade_plan_for_group(
             price_loader=price_loader,
         )
         output_path = trade_plan_output_path(session_group, local_timestamp)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         with timed_task(
             "write_trade_plan_csv",
             session_group=session_group,
@@ -1471,7 +1584,7 @@ def read_ticker_trading_times() -> pd.DataFrame:
 def candidate_output_path(session_group: str, local_timestamp: datetime) -> Path:
     """Return group candidate filename."""
 
-    return OUTPUT_DIR / (
+    return best_signals_dir(OUTPUT_DIR) / (
         f"best_signals_{session_group}_{local_timestamp:%Y-%m-%d_%H-%M}.csv"
     )
 
@@ -1479,7 +1592,7 @@ def candidate_output_path(session_group: str, local_timestamp: datetime) -> Path
 def trade_plan_output_path(session_group: str, local_timestamp: datetime) -> Path:
     """Return group trade-plan filename."""
 
-    return OUTPUT_DIR / (
+    return trade_plans_dir(OUTPUT_DIR) / (
         f"trade_plan_{session_group}_{local_timestamp:%Y-%m-%d_%H-%M}.csv"
     )
 
@@ -1489,7 +1602,7 @@ def find_latest_candidate_file(session_group: str, local_day: date) -> Path:
 
     pattern = f"best_signals_{session_group}_{local_day:%Y-%m-%d}_*.csv"
     candidates = sorted(
-        OUTPUT_DIR.glob(pattern),
+        best_signals_dir(OUTPUT_DIR).glob(pattern),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -1569,8 +1682,17 @@ def print_status(
 
     timezone_info = rules_timezone(rules)
     now = datetime.now(timezone_info)
+    mt5_rules = rules.get("mt5", {})
     print(f"Status at {now:%Y-%m-%d %H:%M %Z}", flush=True)
-    print(f"Output directory: {OUTPUT_DIR}", flush=True)
+    print(f"Runtime root: {OUTPUT_DIR}", flush=True)
+    print(f"Logs directory: {logs_dir(OUTPUT_DIR)}", flush=True)
+    print(f"Best signals directory: {best_signals_dir(OUTPUT_DIR)}", flush=True)
+    print(f"Trade plans directory: {trade_plans_dir(OUTPUT_DIR)}", flush=True)
+    if isinstance(mt5_rules, dict):
+        print(
+            f"MT5 server: {mt5_rules.get('host')}:{mt5_rules.get('port')}",
+            flush=True,
+        )
     print(f"Executed events today/session: {len(executed_events)}", flush=True)
     for group_name, group_rule in rules.get("session_groups", {}).items():
         count = len(tickers_for_group(ticker_metadata, group_name))
@@ -1738,17 +1860,25 @@ def main() -> None:
         run_self_test()
         return
     if args.command == UPDATE_COMMAND:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_directories(OUTPUT_DIR)
         log_path = setup_logging()
         print(f"Logging to {log_path}", flush=True)
+        rules = load_session_rules()
+        print(
+            f"Using MT5 server {rules['mt5']['host']}:{rules['mt5']['port']}",
+            flush=True,
+        )
         with timed_task("one_shot_update_command"):
             update_ticker_trading_times(debug_symbol=args.debug_symbol)
         return
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_runtime_directories(OUTPUT_DIR)
     log_path = setup_logging()
     print("Starting trade_signal_generator.py...", flush=True)
-    print(f"CSV output directory: {OUTPUT_DIR}", flush=True)
+    print(f"Runtime root: {OUTPUT_DIR}", flush=True)
+    print(f"Best signals directory: {best_signals_dir(OUTPUT_DIR)}", flush=True)
+    print(f"Trade plans directory: {trade_plans_dir(OUTPUT_DIR)}", flush=True)
+    print(f"Logs directory: {logs_dir(OUTPUT_DIR)}", flush=True)
     print(f"Log file: {log_path}", flush=True)
     LOGGER.info("Starting trade_signal_generator.py")
 
@@ -1764,6 +1894,10 @@ def main() -> None:
         rules = load_session_rules()
         last_rules_mtime = rules_mtime()
     print(f"Session rules loaded from {session_rules_path()}.", flush=True)
+    print(
+        f"Using MT5 server {rules['mt5']['host']}:{rules['mt5']['port']}",
+        flush=True,
+    )
 
     print(
         "Reading existing ticker_trading_times.csv. MT5 metadata is refreshed "
