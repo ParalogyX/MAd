@@ -36,7 +36,7 @@ The repository includes a `Dockerfile`, `docker-compose.yml`, and
 `install_server.sh` for Linux server deployment. The container runs
 `trade_signal_generator.py`; generated CSV files are written to a host-mounted
 directory instead of staying inside the container. The container connects to
-the MT5 bridge using `MT5_HOST` and `MT5_PORT`.
+the MT5 bridge using the editable `mt5` section in `session_rules.json`.
 
 On the Linux server, make sure the server has SSH access to GitHub for:
 
@@ -50,23 +50,29 @@ Then run the installer script:
 bash install_server.sh
 ```
 
-By default, it clones or updates the repository in `~/MAd`, builds the Docker
-image, starts the `mad-signals` container, and saves CSV files in:
+By default, it clones or updates the repository into a `repo` subdirectory of
+the directory where you ran the installer, builds the Docker image, starts the
+`mad-signals` container, and saves runtime files beside the installer:
 
 ```text
-~/MAd/data
+./logs
+./Best signals
+./Trade plans
+./session_rules.json
 ```
 
 Useful options:
 
 ```bash
-APP_DIR=/opt/MAd DATA_DIR=/var/lib/mad-signals bash install_server.sh
+INSTALL_DIR=/opt/MAd DATA_DIR=/var/lib/mad-signals bash install_server.sh
 ```
 
-Override the MT5 bridge address if needed:
+The Docker compose file uses Linux host networking, so a bridge running on the
+same server can be reached as `127.0.0.1`. The installer seeds this default
+through environment variables; after first startup you can edit it in:
 
-```bash
-MT5_HOST=192.168.2.125 MT5_PORT=8001 bash install_server.sh
+```text
+session_rules.json
 ```
 
 Useful commands after deployment:
@@ -135,11 +141,11 @@ For backward compatibility, public function names such as
 and `libertex` are still accepted, but they route to MT5 internally.
 
 The MT5 bridge must be reachable from the machine or Docker container running
-the library. By default, the project uses:
+the library. In Docker deployment on Linux, the default is:
 
 ```text
-MT5_HOST=192.168.2.125
-MT5_PORT=8001
+session_rules.json -> mt5.host = 127.0.0.1
+session_rules.json -> mt5.port = 8001
 ```
 
 The deterministic `mock` provider remains available for tests only.

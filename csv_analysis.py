@@ -7,7 +7,6 @@ broker login, or order execution.
 from __future__ import annotations
 
 import argparse
-import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -16,6 +15,7 @@ import pandas as pd
 
 from investment_adviser import load_symbol_data
 from investment_adviser.providers.mt5 import MT5MarketDataProvider
+from runtime_paths import best_signals_dir, output_root, signals_path
 from find_signal import (
     calculate_atr14,
     calculate_daily_sl_tp,
@@ -24,7 +24,6 @@ from find_signal import (
 )
 
 NUMBER_OF_SIGNALS = 10
-OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
 SL_TP_COLUMNS = [
     "atr_1d",
     "atr_percent_1d",
@@ -213,19 +212,19 @@ def default_output_path() -> Path:
     """Return best_signals_YYYYMMDD.csv for the current UTC date."""
 
     date_text = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return default_output_dir() / f"best_signals_{date_text}.csv"
+    return best_signals_dir(default_output_dir()) / f"best_signals_{date_text}.csv"
 
 
 def default_input_path() -> Path:
     """Return signals.csv from M_AD_OUTPUT_DIR or the current directory."""
 
-    return default_output_dir() / "signals.csv"
+    return signals_path(default_output_dir())
 
 
 def default_output_dir() -> Path:
     """Return the configured output directory for generated CSV files."""
 
-    return Path(os.getenv(OUTPUT_DIR_ENV_VAR, ".")).expanduser()
+    return output_root()
 
 
 def main() -> None:

@@ -2,6 +2,12 @@
 __pycache__/
 *.csv
 data/
+runtime/
+logs/
+Best signals/
+Trade plans/
+trade_plans/
 *.json
 *.log
+.env
 notes

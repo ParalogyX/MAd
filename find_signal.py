@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import logging
 import math
-import os
 import re
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -27,9 +26,9 @@ from investment_adviser import (
     perform_symbol_sentiment_analysis,
     perform_technical_analysis,
 )
+from runtime_paths import signals_path
 
 STRATEGY_NAME = "Multi-Timeframe Trend Momentum Consensus Signal"
-OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
 LOGGER = logging.getLogger("trade_signal_generator")
 LOGGER.addHandler(logging.NullHandler())
 LOGGER.propagate = False
@@ -892,8 +891,7 @@ def run_scan(output: Path, sort_output: bool, limit: int | None) -> pd.DataFrame
 def default_output_path() -> Path:
     """Return the default signals.csv path, honoring M_AD_OUTPUT_DIR."""
 
-    output_dir = Path(os.getenv(OUTPUT_DIR_ENV_VAR, ".")).expanduser()
-    return output_dir / "signals.csv"
+    return signals_path()
 
 
 def run_self_test() -> None:

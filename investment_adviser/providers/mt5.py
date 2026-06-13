@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import weakref
 from datetime import datetime
 from typing import Any, Callable
 
@@ -21,6 +22,7 @@ from investment_adviser.models import MarketDataRequest
 from investment_adviser.providers.base import InstrumentProvider, MarketDataProvider
 
 MT5ClientFactory = Callable[[], Any]
+_MT5_PROVIDER_INSTANCES: weakref.WeakSet["MT5BaseProvider"] = weakref.WeakSet()
 
 
 class MT5BaseProvider:
@@ -42,6 +44,7 @@ class MT5BaseProvider:
         )
         self._client_factory = client_factory
         self._client: Any | None = None
+        _MT5_PROVIDER_INSTANCES.add(self)
 
     def _get_client(self) -> Any:
         """Return an initialized mt5linux client."""
@@ -69,6 +72,45 @@ class MT5BaseProvider:
 
         self._client = client
         return client
+
+    def configure_connection(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        max_bars: int | None = None,
+    ) -> None:
+        """Update MT5 connection settings and reset any existing client."""
+
+        changed = False
+        if host and host != self.host:
+            self.host = host
+            changed = True
+        if port is not None and port != self.port:
+            self.port = port
+            changed = True
+        if max_bars is not None and max_bars != self.max_bars:
+            self.max_bars = max_bars
+            changed = True
+        if changed:
+            self._client = None
+
+
+def configure_mt5_connection(
+    host: str | None = None,
+    port: int | None = None,
+    max_bars: int | None = None,
+) -> None:
+    """Configure all existing and future MT5 provider instances."""
+
+    if host:
+        os.environ["MT5_HOST"] = host
+    if port is not None:
+        os.environ["MT5_PORT"] = str(port)
+    if max_bars is not None:
+        os.environ["MT5_MAX_BARS"] = str(max_bars)
+
+    for provider in list(_MT5_PROVIDER_INSTANCES):
+        provider.configure_connection(host=host, port=port, max_bars=max_bars)
 
 
 class MT5InstrumentProvider(MT5BaseProvider, InstrumentProvider):

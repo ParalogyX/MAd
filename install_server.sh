@@ -2,9 +2,19 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-git@github.com:ParalogyX/MAd.git}"
-APP_DIR="${APP_DIR:-$HOME/MAd}"
-DATA_DIR="${DATA_DIR:-$APP_DIR/data}"
+INSTALL_DIR="${INSTALL_DIR:-$(pwd -P)}"
+if [ -z "${APP_DIR:-}" ]; then
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        APP_DIR="$INSTALL_DIR"
+    else
+        APP_DIR="$INSTALL_DIR/repo"
+    fi
+fi
+DATA_DIR="${DATA_DIR:-$INSTALL_DIR}"
 SERVICE_NAME="${SERVICE_NAME:-mad-signals}"
+MT5_HOST="${MT5_HOST:-127.0.0.1}"
+MT5_PORT="${MT5_PORT:-8001}"
+TZ="${TZ:-Europe/Amsterdam}"
 SUDO_CMD=()
 
 log() {
@@ -89,8 +99,10 @@ detect_compose_command() {
 
 clone_or_update_repository() {
     if [ -d "$APP_DIR/.git" ]; then
-        log "Updating existing repository in $APP_DIR"
-        git -C "$APP_DIR" pull --ff-only
+        log "Updating existing repository in $APP_DIR from main"
+        git -C "$APP_DIR" fetch origin main
+        git -C "$APP_DIR" checkout main
+        git -C "$APP_DIR" pull --ff-only origin main
         return 0
     fi
 
@@ -99,20 +111,40 @@ clone_or_update_repository() {
     fi
 
     log "Cloning repository into $APP_DIR"
-    git clone "$REPO_URL" "$APP_DIR"
+    git clone --branch main --single-branch "$REPO_URL" "$APP_DIR"
+}
+
+prepare_runtime_directories() {
+    log "Preparing external runtime files in $DATA_DIR"
+    mkdir -p "$DATA_DIR/logs"
+    mkdir -p "$DATA_DIR/Best signals"
+    mkdir -p "$DATA_DIR/Trade plans"
+}
+
+write_compose_env_file() {
+    log "Writing Docker Compose environment file"
+    cat > "$APP_DIR/.env" <<EOF
+M_AD_DATA_DIR=$DATA_DIR
+MT5_HOST=$MT5_HOST
+MT5_PORT=$MT5_PORT
+TZ=$TZ
+EOF
 }
 
 main() {
+    mkdir -p "$INSTALL_DIR"
     install_host_dependencies_if_possible
     detect_docker_command
     detect_compose_command
     clone_or_update_repository
-
-    log "Preparing persistent CSV directory: $DATA_DIR"
-    mkdir -p "$DATA_DIR"
+    prepare_runtime_directories
 
     cd "$APP_DIR"
     export M_AD_DATA_DIR="$DATA_DIR"
+    export MT5_HOST
+    export MT5_PORT
+    export TZ
+    write_compose_env_file
 
     log "Building Docker image"
     "${COMPOSE_CMD[@]}" build
@@ -121,8 +153,13 @@ main() {
     "${COMPOSE_CMD[@]}" up -d
 
     log "Deployment complete"
-    printf 'CSV files will be saved on the server in: %s\n' "$DATA_DIR"
-    printf 'MT5 bridge: %s:%s\n' "${MT5_HOST:-192.168.2.125}" "${MT5_PORT:-8001}"
+    printf 'Repository directory: %s\n' "$APP_DIR"
+    printf 'External runtime directory: %s\n' "$DATA_DIR"
+    printf 'Logs: %s/logs\n' "$DATA_DIR"
+    printf 'Best signals: %s/Best signals\n' "$DATA_DIR"
+    printf 'Trade plans: %s/Trade plans\n' "$DATA_DIR"
+    printf 'Editable session rules: %s/session_rules.json\n' "$DATA_DIR"
+    printf 'MT5 bridge default: %s:%s\n' "$MT5_HOST" "$MT5_PORT"
     printf 'View logs with: cd %s && %s logs -f %s\n' \
         "$APP_DIR" "${COMPOSE_CMD[*]}" "$SERVICE_NAME"
     printf 'Attach console with: cd %s && %s attach %s\n' \

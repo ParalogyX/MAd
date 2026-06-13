@@ -12,6 +12,7 @@ from trade_signal_generator import (
     build_ticker_trading_times,
     call_price_loader,
     build_trade_plan_rows,
+    candidate_output_path,
     classify_ticker,
     classify_ticker_from_metadata,
     convert_exchange_session_to_local,
@@ -24,6 +25,7 @@ from trade_signal_generator import (
     read_ticker_trading_times,
     run_analysis_for_group,
     run_trade_plans_for_all_available_groups,
+    trade_plan_output_path,
 )
 import trade_signal_generator as tsg
 
@@ -34,9 +36,23 @@ def test_session_rules_loading_and_invalid_json_fallback(tmp_path):
 
     assert rules_path.exists()
     assert rules["timezone"] == "Europe/Amsterdam"
+    assert {"host", "port", "max_bars"} <= set(rules["mt5"])
 
     rules_path.write_text("{ invalid", encoding="utf-8")
     assert load_session_rules(rules_path, previous_rules=rules) is rules
+
+
+def test_generated_output_paths_are_split_by_type(monkeypatch, tmp_path):
+    monkeypatch.setattr(tsg, "OUTPUT_DIR", tmp_path)
+    local_time = datetime(2026, 6, 12, 9, 5, tzinfo=ZoneInfo("Europe/Amsterdam"))
+
+    candidate_path = candidate_output_path("forex_major", local_time)
+    trade_path = trade_plan_output_path("forex_major", local_time)
+
+    assert candidate_path.parent == tmp_path / "Best signals"
+    assert trade_path.parent == tmp_path / "Trade plans"
+    assert candidate_path.name.startswith("best_signals_forex_major_")
+    assert trade_path.name.startswith("trade_plan_forex_major_")
 
 
 def test_trading_day_parser():
@@ -399,6 +415,7 @@ def test_manual_signals_command_generates_existing_candidate(monkeypatch, tmp_pa
 
     local_time = datetime(2026, 6, 12, 9, 5, tzinfo=ZoneInfo("Europe/Amsterdam"))
     candidate_path = tsg.candidate_output_path("forex_major", local_time)
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         [
             {
