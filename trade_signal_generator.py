@@ -143,8 +143,8 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
     "session_groups": {
         "crypto_24_7": {
             "enabled": True,
-            "analysis_time": "14:20",
-            "open_time": "15:05",
+            "analysis_time": "15:00",
+            "open_time": "15:10",
             "close_time": "21:45",
             "trading_days": "mon-sun",
             "min_signal_strength": 80,
@@ -154,7 +154,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
         },
         "forex_major": {
             "enabled": True,
-            "analysis_time": "08:45",
+            "analysis_time": "09:00",
             "open_time": "09:05",
             "close_time": "21:45",
             "trading_days": "mon-fri",
@@ -165,7 +165,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
         },
         "forex_exotic": {
             "enabled": True,
-            "analysis_time": "08:45",
+            "analysis_time": "09:00",
             "open_time": "09:15",
             "close_time": "18:30",
             "trading_days": "mon-fri",
@@ -176,7 +176,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
         },
         "europe_stock_index": {
             "enabled": True,
-            "analysis_time": "08:40",
+            "analysis_time": "09:00",
             "open_time": "09:10",
             "close_time": "17:20",
             "trading_days": "mon-fri",
@@ -187,7 +187,7 @@ DEFAULT_SESSION_RULES: dict[str, Any] = {
         },
         "us_stock_index": {
             "enabled": True,
-            "analysis_time": "14:40",
+            "analysis_time": "15:00",
             "open_time": "15:45",
             "close_time": "21:45",
             "trading_days": "mon-fri",
