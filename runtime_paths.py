@@ -9,10 +9,12 @@ OUTPUT_DIR_ENV_VAR = "M_AD_OUTPUT_DIR"
 LOG_DIR_ENV_VAR = "M_AD_LOG_DIR"
 BEST_SIGNALS_DIR_ENV_VAR = "M_AD_BEST_SIGNALS_DIR"
 TRADE_PLANS_DIR_ENV_VAR = "M_AD_TRADE_PLANS_DIR"
+RESULTS_DIR_ENV_VAR = "M_AD_RESULTS_DIR"
 
 LOG_DIR_NAME = "logs"
 BEST_SIGNALS_DIR_NAME = "Best signals"
 TRADE_PLANS_DIR_NAME = "Trade plans"
+RESULTS_DIR_NAME = "Results"
 
 
 def output_root(default: str | Path = ".") -> Path:
@@ -48,6 +50,15 @@ def trade_plans_dir(root: Path | None = None) -> Path:
     return (root or output_root()) / TRADE_PLANS_DIR_NAME
 
 
+def results_dir(root: Path | None = None) -> Path:
+    """Return the directory where close-result CSV files are stored."""
+
+    configured = os.getenv(RESULTS_DIR_ENV_VAR)
+    if configured:
+        return Path(configured).expanduser()
+    return (root or output_root()) / RESULTS_DIR_NAME
+
+
 def signals_path(root: Path | None = None) -> Path:
     """Return the default path for the intermediate signals.csv file."""
 
@@ -62,3 +73,4 @@ def ensure_runtime_directories(root: Path | None = None) -> None:
     logs_dir(base).mkdir(parents=True, exist_ok=True)
     best_signals_dir(base).mkdir(parents=True, exist_ok=True)
     trade_plans_dir(base).mkdir(parents=True, exist_ok=True)
+    results_dir(base).mkdir(parents=True, exist_ok=True)

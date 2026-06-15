@@ -10,6 +10,7 @@ from trade_signal_generator import (
     SESSION_RULES_FILE,
     analyze_group_tickers,
     build_ticker_trading_times,
+    build_close_result_rows,
     call_price_loader,
     build_trade_plan_rows,
     candidate_output_path,
@@ -24,7 +25,9 @@ from trade_signal_generator import (
     parse_trading_days,
     read_ticker_trading_times,
     run_analysis_for_group,
+    run_close_results_for_groups,
     run_trade_plans_for_all_available_groups,
+    results_output_path,
     trade_plan_output_path,
 )
 import trade_signal_generator as tsg
@@ -51,6 +54,7 @@ def test_generated_output_paths_are_split_by_type(monkeypatch, tmp_path):
 
     assert candidate_path.parent == tmp_path / "Best signals"
     assert trade_path.parent == tmp_path / "Trade plans"
+    assert results_output_path(local_time).parent == tmp_path / "Results"
     assert candidate_path.name.startswith("best_signals_forex_major_")
     assert trade_path.name.startswith("trade_plan_forex_major_")
 
@@ -492,3 +496,120 @@ def test_min_signal_strength_filters_trade_plan_only(monkeypatch, tmp_path):
     )
     trade_plan = pd.read_csv(trade_paths[0])
     assert list(trade_plan["ticker"]) == ["HIGH"]
+
+
+def test_close_result_rows_detect_tp_sl_and_profitability():
+    trade_plan = pd.DataFrame(
+        [
+            {
+                "ticker": "BUYTP",
+                "entry_time_local": "2026-06-12 09:05",
+                "entry_price": 100,
+                "direction": "buy",
+                "take_profit": 105,
+                "stop_loss": 95,
+            },
+            {
+                "ticker": "SELLSL",
+                "entry_time_local": "2026-06-12 09:05",
+                "entry_price": 100,
+                "direction": "sell",
+                "take_profit": 95,
+                "stop_loss": 105,
+            },
+            {
+                "ticker": "BUYWIN",
+                "entry_time_local": "2026-06-12 09:05",
+                "entry_price": 100,
+                "direction": "buy",
+                "take_profit": 110,
+                "stop_loss": 90,
+            },
+        ]
+    )
+
+    def price_loader(ticker, side=None):
+        return {"BUYTP": 103, "SELLSL": 99, "BUYWIN": 102}[ticker]
+
+    def data_loader(symbol, timeframe, begin_time, end_time, provider="fallback"):
+        values = {
+            "BUYTP": (100, 106, 99, 103),
+            "SELLSL": (100, 106, 98, 99),
+            "BUYWIN": (100, 103, 99, 102),
+        }[symbol]
+        return pd.DataFrame(
+            [
+                {
+                    "timestamp": begin_time,
+                    "open": values[0],
+                    "high": values[1],
+                    "low": values[2],
+                    "close": values[3],
+                    "volume": 1,
+                }
+            ]
+        )
+
+    rows = build_close_result_rows(
+        trade_plan,
+        datetime(2026, 6, 12, 21, 45, tzinfo=ZoneInfo("Europe/Amsterdam")),
+        price_loader=price_loader,
+        data_loader=data_loader,
+    )
+
+    by_ticker = {row["Ticker"]: row for row in rows}
+    assert by_ticker["BUYTP"]["TP triggered (yes/no)"] == "yes"
+    assert by_ticker["BUYTP"]["SL triggered (yes/no)"] == "no"
+    assert by_ticker["BUYTP"]["profitable (yes/no)"] == "yes"
+    assert by_ticker["SELLSL"]["SL triggered (yes/no)"] == "yes"
+    assert by_ticker["SELLSL"]["profitable (yes/no)"] == "no"
+    assert by_ticker["BUYWIN"]["TP triggered (yes/no)"] == "no"
+    assert by_ticker["BUYWIN"]["profitable (yes/no)"] == "yes"
+
+
+def test_close_results_for_groups_combines_trade_plans(monkeypatch, tmp_path):
+    monkeypatch.setattr(tsg, "OUTPUT_DIR", tmp_path)
+    rules = copy.deepcopy(DEFAULT_SESSION_RULES)
+    local_time = datetime(2026, 6, 12, 21, 45, tzinfo=ZoneInfo("Europe/Amsterdam"))
+    for group_name in ("forex_major", "commodity_us"):
+        path = tsg.trade_plan_output_path(group_name, local_time)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                {
+                    "ticker": group_name,
+                    "entry_time_local": "2026-06-12 09:05",
+                    "entry_price": 100,
+                    "direction": "buy",
+                    "take_profit": 110,
+                    "stop_loss": 90,
+                }
+            ]
+        ).to_csv(path, index=False)
+
+    def data_loader(symbol, timeframe, begin_time, end_time, provider="fallback"):
+        return pd.DataFrame(
+            [
+                {
+                    "timestamp": begin_time,
+                    "open": 100,
+                    "high": 103,
+                    "low": 99,
+                    "close": 102,
+                    "volume": 1,
+                }
+            ]
+        )
+
+    output_path = run_close_results_for_groups(
+        ["forex_major", "commodity_us"],
+        rules,
+        local_time,
+        price_loader=lambda ticker, side=None: 102,
+        data_loader=data_loader,
+    )
+
+    assert output_path == tmp_path / "Results" / "results_2026-06-12_21-45.csv"
+    result = pd.read_csv(output_path)
+    assert list(result["Ticker"]) == ["forex_major", "commodity_us"]
+    assert set(result["profitable (yes/no)"]) == {"yes"}

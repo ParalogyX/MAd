@@ -97,6 +97,18 @@ TRADE_PLAN_COLUMNS = [
     "reason",
 ]
 
+RESULT_COLUMNS = [
+    "Ticker",
+    "open time",
+    "open price",
+    "direction of the bid (buy/sell)",
+    "close price",
+    "close time",
+    "TP triggered (yes/no)",
+    "SL triggered (yes/no)",
+    "profitable (yes/no)",
+]
+
 DEFAULT_SESSION_RULES: dict[str, object] = {
     "timezone": DEFAULT_TIMEZONE,
     "mt5": {

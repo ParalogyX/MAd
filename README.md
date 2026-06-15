@@ -58,6 +58,7 @@ the directory where you ran the installer, builds the Docker image, starts the
 ./logs
 ./Best signals
 ./Trade plans
+./Results
 ./session_rules.json
 ```
 

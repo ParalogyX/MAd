@@ -6,6 +6,7 @@ import trade_signal_generator as tsg
 def test_scheduler_config_exports_are_backward_compatible():
     assert tsg.DEFAULT_SESSION_RULES is scheduler_config.DEFAULT_SESSION_RULES
     assert tsg.TRADE_PLAN_COLUMNS == scheduler_config.TRADE_PLAN_COLUMNS
+    assert tsg.RESULT_COLUMNS == scheduler_config.RESULT_COLUMNS
     assert tsg.METADATA_COLUMNS == scheduler_config.METADATA_COLUMNS
     assert tsg.TRIGGER_COMMAND == scheduler_config.TRIGGER_COMMAND
 

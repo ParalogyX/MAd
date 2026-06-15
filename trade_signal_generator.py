@@ -22,9 +22,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from csv_analysis import get_current_price
+from investment_adviser import load_symbol_data
 from find_signal import (
     OUTPUT_COLUMNS,
     calculate_daily_sl_tp,
+    normalize_ohlcv_columns,
     process_symbol,
     smart_round_price,
 )
@@ -36,6 +38,7 @@ from runtime_paths import (
     best_signals_dir,
     ensure_runtime_directories,
     logs_dir,
+    results_dir,
     trade_plans_dir,
 )
 from scheduler_config import (
@@ -55,6 +58,7 @@ from scheduler_config import (
     OUTPUT_DIR,
     QUIT_COMMAND,
     RELOAD_COMMAND,
+    RESULT_COLUMNS,
     SESSION_RULES_FILE,
     SIGNALS_ALIAS,
     SIGNALS_COMMAND,
@@ -1106,6 +1110,129 @@ def run_trade_plans_for_all_available_groups(
         return output_paths
 
 
+def run_close_results_for_groups(
+    session_groups: list[str],
+    rules: dict[str, Any],
+    local_timestamp: datetime,
+    price_loader: Callable[..., float | None] = get_current_price,
+    data_loader: Callable[..., pd.DataFrame] = load_symbol_data,
+) -> Path | None:
+    """Write close-result rows for groups that close at the same local time."""
+
+    with timed_task(
+        "run_close_results_for_groups",
+        session_groups=",".join(session_groups),
+    ):
+        timezone_info = rules_timezone(rules)
+        close_timestamp = local_timestamp.astimezone(timezone_info)
+        trade_plans: list[pd.DataFrame] = []
+        for group_name in session_groups:
+            try:
+                plan_path = find_latest_trade_plan_file(
+                    group_name,
+                    close_timestamp.date(),
+                )
+            except FileNotFoundError as exc:
+                LOGGER.info("Skipping close results for %s: %s", group_name, exc)
+                print(
+                    f"No trade plan file for {group_name}; close results skipped.",
+                    flush=True,
+                )
+                continue
+            with timed_task("load_trade_plan_csv", path=plan_path):
+                trade_plans.append(pd.read_csv(plan_path))
+
+        if not trade_plans:
+            print("No trade plan rows found for close result generation.", flush=True)
+            return None
+
+        combined = pd.concat(trade_plans, ignore_index=True)
+        rows = build_close_result_rows(
+            trade_plan=combined,
+            local_timestamp=close_timestamp,
+            price_loader=price_loader,
+            data_loader=data_loader,
+        )
+        if not rows:
+            print("No close result rows to save.", flush=True)
+            return None
+
+        output_path = results_output_path(close_timestamp)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with timed_task("write_results_csv", path=output_path, rows=len(rows)):
+            pd.DataFrame(rows, columns=RESULT_COLUMNS).to_csv(output_path, index=False)
+        print(f"Saved {len(rows)} close result rows to {output_path.name}.", flush=True)
+        return output_path
+
+
+def build_close_result_rows(
+    trade_plan: pd.DataFrame,
+    local_timestamp: datetime,
+    price_loader: Callable[..., float | None] = get_current_price,
+    data_loader: Callable[..., pd.DataFrame] = load_symbol_data,
+) -> list[dict[str, Any]]:
+    """Build close-result rows from trade-plan rows."""
+
+    timezone_info = local_timestamp.tzinfo or ZoneInfo(DEFAULT_TIMEZONE)
+    close_text = local_timestamp.strftime("%Y-%m-%d %H:%M")
+    rows: list[dict[str, Any]] = []
+    for _, trade in trade_plan.iterrows():
+        ticker = _safe_text(trade.get("ticker") or trade.get("Ticker name"))
+        direction = _safe_text(
+            trade.get("direction") or trade.get("direction of trading")
+        ).lower()
+        if not ticker or direction not in {"buy", "sell"}:
+            continue
+
+        open_price = _to_float(trade.get("entry_price") or trade.get("current price"))
+        if open_price is None:
+            LOGGER.info("Skipping %s close result because open price is missing", ticker)
+            continue
+
+        open_text = _safe_text(trade.get("entry_time_local") or trade.get("open time"))
+        open_timestamp = parse_local_datetime(open_text, timezone_info)
+        if open_timestamp is None:
+            LOGGER.info("Skipping %s close result because open time is invalid", ticker)
+            continue
+
+        close_price = fetch_close_price(ticker, direction, price_loader)
+        market_window = load_trade_window_data(
+            ticker=ticker,
+            open_timestamp=open_timestamp,
+            close_timestamp=local_timestamp,
+            data_loader=data_loader,
+        )
+        if close_price is None:
+            close_price = latest_close_from_window(market_window)
+        tp_triggered, sl_triggered = calculate_tp_sl_triggers(
+            market_window=market_window,
+            direction=direction,
+            take_profit=_to_float(trade.get("take_profit") or trade.get("Take Profit level")),
+            stop_loss=_to_float(trade.get("stop_loss") or trade.get("Stop Loss level")),
+        )
+        profitable = calculate_profitability(
+            direction=direction,
+            open_price=open_price,
+            close_price=close_price,
+            tp_triggered=tp_triggered,
+            sl_triggered=sl_triggered,
+        )
+        rows.append(
+            {
+                "Ticker": ticker,
+                "open time": open_timestamp.strftime("%Y-%m-%d %H:%M"),
+                "open price": smart_round_price(open_price),
+                "direction of the bid (buy/sell)": direction,
+                "close price": smart_round_price(close_price) if close_price else None,
+                "close time": close_text,
+                "TP triggered (yes/no)": yes_no(tp_triggered),
+                "SL triggered (yes/no)": yes_no(sl_triggered),
+                "profitable (yes/no)": yes_no(profitable),
+            }
+        )
+    return rows
+
+
 def build_trade_plan_rows(
     candidates: pd.DataFrame,
     ticker_metadata: pd.DataFrame,
@@ -1252,6 +1379,132 @@ def call_price_loader(
     return price_loader(ticker)
 
 
+def fetch_close_price(
+    ticker: str,
+    direction: str,
+    price_loader: Callable[..., float | None],
+) -> float | None:
+    """Fetch the close quote using the side that exits the trade direction."""
+
+    close_side = "sell" if direction == "buy" else "buy"
+    with timed_task("fetch_close_price", ticker=ticker, side=close_side):
+        return call_price_loader(price_loader, ticker, close_side)
+
+
+def parse_local_datetime(value: str, timezone_info: Any) -> datetime | None:
+    """Parse local timestamp text from generated trade-plan CSV files."""
+
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone_info)
+    return parsed.astimezone(timezone_info)
+
+
+def load_trade_window_data(
+    ticker: str,
+    open_timestamp: datetime,
+    close_timestamp: datetime,
+    data_loader: Callable[..., pd.DataFrame] = load_symbol_data,
+) -> pd.DataFrame:
+    """Load intraday OHLCV data between trade open and close times."""
+
+    if close_timestamp <= open_timestamp:
+        return pd.DataFrame()
+    begin_time = open_timestamp.astimezone(timezone.utc)
+    end_time = close_timestamp.astimezone(timezone.utc)
+    for timeframe in ("1m", "5m", "15m"):
+        try:
+            data = data_loader(
+                symbol=ticker,
+                timeframe=timeframe,
+                begin_time=begin_time,
+                end_time=end_time,
+                provider="fallback",
+            )
+            return normalize_ohlcv_columns(data)
+        except Exception as exc:
+            LOGGER.info(
+                "Could not load %s trade-window data for %s: %s",
+                timeframe,
+                ticker,
+                exc,
+            )
+    return pd.DataFrame()
+
+
+def latest_close_from_window(market_window: pd.DataFrame) -> float | None:
+    """Return the latest close from market-window data, if available."""
+
+    if market_window.empty or "close" not in market_window.columns:
+        return None
+    close_values = pd.to_numeric(market_window["close"], errors="coerce").dropna()
+    if close_values.empty:
+        return None
+    return float(close_values.iloc[-1])
+
+
+def calculate_tp_sl_triggers(
+    market_window: pd.DataFrame,
+    direction: str,
+    take_profit: float | None,
+    stop_loss: float | None,
+) -> tuple[bool, bool]:
+    """Return whether TP/SL levels were touched inside the trade window."""
+
+    if market_window.empty:
+        return False, False
+    if "high" not in market_window.columns or "low" not in market_window.columns:
+        return False, False
+    high = pd.to_numeric(market_window.get("high"), errors="coerce")
+    low = pd.to_numeric(market_window.get("low"), errors="coerce")
+    tp_triggered = False
+    sl_triggered = False
+    if direction == "buy":
+        if take_profit is not None:
+            tp_triggered = bool((high >= take_profit).any())
+        if stop_loss is not None:
+            sl_triggered = bool((low <= stop_loss).any())
+    elif direction == "sell":
+        if take_profit is not None:
+            tp_triggered = bool((low <= take_profit).any())
+        if stop_loss is not None:
+            sl_triggered = bool((high >= stop_loss).any())
+    return tp_triggered, sl_triggered
+
+
+def calculate_profitability(
+    direction: str,
+    open_price: float,
+    close_price: float | None,
+    tp_triggered: bool,
+    sl_triggered: bool,
+) -> bool:
+    """Return the requested yes/no profitability result.
+
+    If both TP and SL are observed in coarse OHLCV data, SL is treated as
+    decisive because the exact intrabar order is unknown.
+    """
+
+    if sl_triggered:
+        return False
+    if tp_triggered:
+        return True
+    if close_price is None:
+        return False
+    if direction == "buy":
+        return close_price > open_price
+    if direction == "sell":
+        return close_price < open_price
+    return False
+
+
+def yes_no(value: bool) -> str:
+    return "yes" if value else "no"
+
+
 def add_metadata_columns(
     signals: pd.DataFrame,
     ticker_metadata: pd.DataFrame,
@@ -1317,6 +1570,12 @@ def trade_plan_output_path(session_group: str, local_timestamp: datetime) -> Pat
     )
 
 
+def results_output_path(local_timestamp: datetime) -> Path:
+    """Return close-result filename for a local timestamp."""
+
+    return results_dir(OUTPUT_DIR) / f"results_{local_timestamp:%Y-%m-%d_%H-%M}.csv"
+
+
 def find_latest_candidate_file(session_group: str, local_day: date) -> Path:
     """Find the latest candidate file for a group on a local date."""
 
@@ -1331,6 +1590,22 @@ def find_latest_candidate_file(session_group: str, local_day: date) -> Path:
             f"No candidate file found for {session_group} on {local_day}."
         )
     return candidates[0]
+
+
+def find_latest_trade_plan_file(session_group: str, local_day: date) -> Path:
+    """Find the latest trade-plan file for a group on a local date."""
+
+    pattern = f"trade_plan_{session_group}_{local_day:%Y-%m-%d}_*.csv"
+    plans = sorted(
+        trade_plans_dir(OUTPUT_DIR).glob(pattern),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not plans:
+        raise FileNotFoundError(
+            f"No trade-plan file found for {session_group} on {local_day}."
+        )
+    return plans[0]
 
 
 def due_session_events(
@@ -1387,10 +1662,11 @@ def execute_due_event(
         elif event_type == "close":
             print(
                 f"Close event reached for {group_name} at "
-                f"{local_timestamp:%Y-%m-%d %H:%M}. No order action is taken.",
+                f"{local_timestamp:%Y-%m-%d %H:%M}. Writing result CSV.",
                 flush=True,
             )
-            LOGGER.info("Close event reached for %s; no order action taken", group_name)
+            run_close_results_for_groups([group_name], rules, local_timestamp)
+            LOGGER.info("Close event reached for %s; result CSV handled", group_name)
 
 
 def print_status(
@@ -1408,6 +1684,7 @@ def print_status(
     print(f"Logs directory: {logs_dir(OUTPUT_DIR)}", flush=True)
     print(f"Best signals directory: {best_signals_dir(OUTPUT_DIR)}", flush=True)
     print(f"Trade plans directory: {trade_plans_dir(OUTPUT_DIR)}", flush=True)
+    print(f"Results directory: {results_dir(OUTPUT_DIR)}", flush=True)
     if isinstance(mt5_rules, dict):
         print(
             f"MT5 server: {mt5_rules.get('host')}:{mt5_rules.get('port')}",
@@ -1598,6 +1875,7 @@ def main() -> None:
     print(f"Runtime root: {OUTPUT_DIR}", flush=True)
     print(f"Best signals directory: {best_signals_dir(OUTPUT_DIR)}", flush=True)
     print(f"Trade plans directory: {trade_plans_dir(OUTPUT_DIR)}", flush=True)
+    print(f"Results directory: {results_dir(OUTPUT_DIR)}", flush=True)
     print(f"Logs directory: {logs_dir(OUTPUT_DIR)}", flush=True)
     print(f"Log file: {log_path}", flush=True)
     LOGGER.info("Starting trade_signal_generator.py")
@@ -1691,12 +1969,27 @@ def main() -> None:
 
         timezone_info = rules_timezone(rules)
         local_timestamp = datetime.now(timezone_info).replace(second=0, microsecond=0)
-        for event_key, group_name, event_type in due_session_events(
+        due_events = due_session_events(
             rules,
             ticker_metadata,
             local_timestamp,
             executed_events,
-        ):
+        )
+        close_events = [event for event in due_events if event[2] == "close"]
+        non_close_events = [event for event in due_events if event[2] != "close"]
+
+        if close_events:
+            close_groups = [group_name for _, group_name, _ in close_events]
+            try:
+                run_close_results_for_groups(close_groups, rules, local_timestamp)
+            except Exception as exc:
+                LOGGER.exception("Scheduled close-result generation failed")
+                print(f"ERROR writing close results: {exc}", flush=True)
+            for event_key, _, _ in close_events:
+                executed_events.add(event_key)
+            action_completed = True
+
+        for event_key, group_name, event_type in non_close_events:
             try:
                 execute_due_event(
                     group_name,
