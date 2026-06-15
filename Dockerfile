@@ -18,7 +18,8 @@ RUN apt-get update \
 
 COPY pyproject.toml requirements.txt README.md ./
 COPY investment_adviser ./investment_adviser
-COPY runtime_paths.py ticker_classification_rules.py ./
+COPY runtime_paths.py scheduler_config.py scheduler_logging.py ./
+COPY ticker_classification_rules.py ./
 COPY find_signal.py csv_analysis.py trade_signal_generator.py ./
 
 RUN python -m pip install --upgrade pip \
