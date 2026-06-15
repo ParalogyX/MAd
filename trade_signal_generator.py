@@ -10,16 +10,12 @@ import argparse
 import copy
 import inspect
 import json
-import logging
 import math
-import os
 import queue
 import re
 import threading
-from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from time import perf_counter
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -32,11 +28,6 @@ from find_signal import (
     process_symbol,
     smart_round_price,
 )
-from investment_adviser.config import (
-    MT5_DEFAULT_HOST,
-    MT5_DEFAULT_MAX_BARS,
-    MT5_DEFAULT_PORT,
-)
 from investment_adviser.providers.mt5 import (
     MT5InstrumentProvider,
     configure_mt5_connection,
@@ -45,314 +36,43 @@ from runtime_paths import (
     best_signals_dir,
     ensure_runtime_directories,
     logs_dir,
-    output_root,
     trade_plans_dir,
 )
+from scheduler_config import (
+    CLASSIFICATION_OVERRIDES_FILE,
+    DAY_TO_INDEX,
+    DEFAULT_MT5_HOST,
+    DEFAULT_MT5_MAX_BARS,
+    DEFAULT_MT5_PORT,
+    DEFAULT_SESSION_RULES,
+    DEFAULT_TIMEZONE,
+    GROUP_DEFAULT_WINDOWS,
+    LEGACY_EXIT_COMMAND,
+    LOG_PREFIX,
+    LOG_RETENTION_DAYS,
+    METADATA_COLUMNS,
+    MT5_SYMBOL_SESSIONS_FILE,
+    OUTPUT_DIR,
+    QUIT_COMMAND,
+    RELOAD_COMMAND,
+    SESSION_RULES_FILE,
+    SIGNALS_ALIAS,
+    SIGNALS_COMMAND,
+    STATUS_COMMAND,
+    TICKER_TRADING_TIMES_FILE,
+    TRADE_PLAN_COLUMNS,
+    TRIGGER_COMMAND,
+    UPDATE_COMMAND,
+)
+from scheduler_logging import (
+    LOGGER,
+    cleanup_old_logs,
+    ensure_daily_logging,
+    log_file_path,
+    setup_logging,
+    timed_task,
+)
 import ticker_classification_rules as classification_rules
-
-
-def _env_int(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return int(raw_value)
-    except ValueError:
-        return default
-
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-OUTPUT_DIR = output_root(PROJECT_ROOT)
-SESSION_RULES_FILE = "session_rules.json"
-TICKER_TRADING_TIMES_FILE = "ticker_trading_times.csv"
-MT5_SYMBOL_SESSIONS_FILE = "mt5_symbol_sessions.csv"
-CLASSIFICATION_OVERRIDES_FILE = "ticker_classification_overrides.csv"
-LOG_PREFIX = "trade_signal_generator"
-LOG_RETENTION_DAYS = 30
-TRIGGER_COMMAND = "now"
-UPDATE_COMMAND = "update"
-RELOAD_COMMAND = "reload"
-STATUS_COMMAND = "status"
-SIGNALS_COMMAND = "signals"
-SIGNALS_ALIAS = "sig"
-QUIT_COMMAND = "quit"
-LEGACY_EXIT_COMMAND = "stop"
-LOGGER = logging.getLogger("trade_signal_generator")
-LOGGER.addHandler(logging.NullHandler())
-LOGGER.propagate = False
-_LOGGING_CONFIGURED = False
-_LOG_HANDLER: logging.FileHandler | None = None
-_LOG_DATE: date | None = None
-
-DEFAULT_TIMEZONE = "Europe/Amsterdam"
-DEFAULT_MT5_HOST = os.getenv("MT5_HOST", MT5_DEFAULT_HOST)
-DEFAULT_MT5_PORT = _env_int("MT5_PORT", MT5_DEFAULT_PORT)
-DEFAULT_MT5_MAX_BARS = _env_int("MT5_MAX_BARS", MT5_DEFAULT_MAX_BARS)
-METADATA_COLUMNS = [
-    "ticker",
-    "description",
-    "start_trade_time",
-    "end_trade_time",
-    "trading_days",
-    "ticker_type",
-    "session_group",
-    "classification_source",
-    "classification_reason",
-    "exchange",
-    "country",
-    "category",
-    "path",
-    "currency_base",
-    "currency_profit",
-    "raw_sessions",
-    "last_updated_utc",
-]
-TRADE_PLAN_COLUMNS = [
-    "Ticker name",
-    "current price",
-    "direction of trading",
-    "Stop Loss level",
-    "Take Profit level",
-    "ticker",
-    "description",
-    "session_group",
-    "entry_time_local",
-    "close_time_local",
-    "entry_price",
-    "direction",
-    "signal_strength",
-    "stop_loss",
-    "take_profit",
-    "risk_reward_ratio",
-    "analysis_price",
-    "price_drift_percent",
-    "entry_validation_result",
-    "reason",
-]
-
-DEFAULT_SESSION_RULES: dict[str, Any] = {
-    "timezone": DEFAULT_TIMEZONE,
-    "mt5": {
-        "host": DEFAULT_MT5_HOST,
-        "port": DEFAULT_MT5_PORT,
-        "max_bars": DEFAULT_MT5_MAX_BARS,
-    },
-    "best_signal_limit": 10,
-    "entry_check_minutes_before_open": 0,
-    "rules_reload_interval_seconds": 60,
-    "session_groups": {
-        "crypto_24_7": {
-            "enabled": True,
-            "analysis_time": "15:00",
-            "open_time": "15:10",
-            "close_time": "21:45",
-            "trading_days": "mon-sun",
-            "min_signal_strength": 80,
-            "sl_multiplier": 0.40,
-            "tp_base_multiplier": 0.50,
-            "tp_strength_multiplier": 0.20,
-        },
-        "forex_major": {
-            "enabled": True,
-            "analysis_time": "09:00",
-            "open_time": "09:05",
-            "close_time": "21:45",
-            "trading_days": "mon-fri",
-            "min_signal_strength": 70,
-            "sl_multiplier": 0.45,
-            "tp_base_multiplier": 0.60,
-            "tp_strength_multiplier": 0.25,
-        },
-        "forex_exotic": {
-            "enabled": True,
-            "analysis_time": "09:00",
-            "open_time": "09:15",
-            "close_time": "18:30",
-            "trading_days": "mon-fri",
-            "min_signal_strength": 75,
-            "sl_multiplier": 0.45,
-            "tp_base_multiplier": 0.55,
-            "tp_strength_multiplier": 0.20,
-        },
-        "europe_stock_index": {
-            "enabled": True,
-            "analysis_time": "09:00",
-            "open_time": "09:10",
-            "close_time": "17:20",
-            "trading_days": "mon-fri",
-            "min_signal_strength": 80,
-            "sl_multiplier": 0.40,
-            "tp_base_multiplier": 0.50,
-            "tp_strength_multiplier": 0.20,
-        },
-        "us_stock_index": {
-            "enabled": True,
-            "analysis_time": "15:00",
-            "open_time": "15:45",
-            "close_time": "21:45",
-            "trading_days": "mon-fri",
-            "min_signal_strength": 85,
-            "sl_multiplier": 0.40,
-            "tp_base_multiplier": 0.50,
-            "tp_strength_multiplier": 0.20,
-        },
-        "commodity_us": {
-            "enabled": True,
-            "analysis_time": "15:00",
-            "open_time": "15:45",
-            "close_time": "21:45",
-            "trading_days": "mon-fri",
-            "min_signal_strength": 70,
-            "sl_multiplier": 0.40,
-            "tp_base_multiplier": 0.50,
-            "tp_strength_multiplier": 0.20,
-        },
-        "asia_index": {
-            "enabled": False,
-            "analysis_time": "01:30",
-            "open_time": "02:15",
-            "close_time": "08:30",
-            "trading_days": "mon-fri",
-            "min_signal_strength": 60,
-            "sl_multiplier": 0.40,
-            "tp_base_multiplier": 0.50,
-            "tp_strength_multiplier": 0.20,
-        },
-        "israel_index": {
-            "enabled": False,
-            "analysis_time": "08:30",
-            "open_time": "09:00",
-            "close_time": "16:00",
-            "trading_days": "sun-thu",
-            "min_signal_strength": 60,
-            "sl_multiplier": 0.40,
-            "tp_base_multiplier": 0.50,
-            "tp_strength_multiplier": 0.20,
-        },
-        "unknown": {
-            "enabled": False,
-            "analysis_time": "08:45",
-            "open_time": "09:05",
-            "close_time": "21:45",
-            "trading_days": "mon-fri",
-            "min_signal_strength": 60,
-            "sl_multiplier": 0.45,
-            "tp_base_multiplier": 0.60,
-            "tp_strength_multiplier": 0.25,
-        },
-    },
-}
-
-DAY_TO_INDEX = {
-    "mon": 0,
-    "tue": 1,
-    "wed": 2,
-    "thu": 3,
-    "fri": 4,
-    "sat": 5,
-    "sun": 6,
-}
-GROUP_DEFAULT_WINDOWS = {
-    "crypto_24_7": ("00:00", "23:59", "mon-sun"),
-    "forex_major": ("00:05", "23:55", "mon-fri"),
-    "forex_exotic": ("00:05", "23:55", "mon-fri"),
-    "europe_stock_index": ("09:00", "17:30", "mon-fri"),
-    "us_stock_index": ("15:30", "22:00", "mon-fri"),
-    "commodity_us": ("15:00", "21:45", "mon-fri"),
-    "asia_index": ("02:15", "08:30", "mon-fri"),
-    "israel_index": ("09:00", "16:00", "sun-thu"),
-    "unknown": ("", "", "unknown"),
-}
-
-
-def setup_logging() -> Path:
-    """Configure file logging for scheduler timings and operational events."""
-
-    global _LOGGING_CONFIGURED
-    ensure_runtime_directories(OUTPUT_DIR)
-    if _LOGGING_CONFIGURED:
-        return ensure_daily_logging()
-
-    LOGGER.setLevel(logging.INFO)
-    _LOGGING_CONFIGURED = True
-    log_path = ensure_daily_logging()
-    LOGGER.propagate = False
-    LOGGER.info("Logging initialized at %s", log_path)
-    return log_path
-
-
-def ensure_daily_logging() -> Path:
-    """Ensure the logger writes to today's dated log file."""
-
-    global _LOG_HANDLER, _LOG_DATE
-    today = datetime.now().date()
-    log_path = log_file_path(today)
-    if _LOG_HANDLER is not None and _LOG_DATE == today:
-        return log_path
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    if _LOG_HANDLER is not None:
-        LOGGER.removeHandler(_LOG_HANDLER)
-        _LOG_HANDLER.close()
-
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s %(levelname)s %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
-    LOGGER.addHandler(handler)
-    _LOG_HANDLER = handler
-    _LOG_DATE = today
-    cleanup_old_logs()
-    return log_path
-
-
-def log_file_path(log_date: date | None = None) -> Path:
-    """Return the dated scheduler log path for a date."""
-
-    selected_date = log_date or datetime.now().date()
-    return logs_dir(OUTPUT_DIR) / f"{LOG_PREFIX}_{selected_date:%Y-%m-%d}.log"
-
-
-def cleanup_old_logs(retention_days: int = LOG_RETENTION_DAYS) -> None:
-    """Delete log files older than the retention window."""
-
-    cutoff = datetime.now().timestamp() - retention_days * 24 * 60 * 60
-    for path in logs_dir(OUTPUT_DIR).glob("*.log"):
-        try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
-        except OSError:
-            continue
-
-
-@contextmanager
-def timed_task(task_name: str, **context: Any):
-    """Log task start, success/failure, and elapsed time."""
-
-    if _LOGGING_CONFIGURED:
-        ensure_daily_logging()
-    context_text = _format_log_context(context)
-    LOGGER.info("START %s%s", task_name, context_text)
-    started_at = perf_counter()
-    try:
-        yield
-    except Exception:
-        elapsed = perf_counter() - started_at
-        LOGGER.exception("FAILED %s after %.3fs%s", task_name, elapsed, context_text)
-        raise
-    else:
-        elapsed = perf_counter() - started_at
-        LOGGER.info("DONE %s in %.3fs%s", task_name, elapsed, context_text)
-
-
-def _format_log_context(context: dict[str, Any]) -> str:
-    if not context:
-        return ""
-    parts = [f"{key}={value}" for key, value in context.items()]
-    return " [" + ", ".join(parts) + "]"
 
 
 def print_command_help() -> None:
@@ -1762,15 +1482,15 @@ def run_self_test() -> None:
     sunday = datetime(2026, 6, 14, 8, 45, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
     assert due_session_events(rules, metadata, sunday, set()) == []
 
-    friday = datetime(2026, 6, 12, 8, 45, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+    friday = datetime(2026, 6, 12, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
     due = due_session_events(rules, metadata, friday, set())
     assert any(event[1:] == ("forex_major", "analysis") for event in due)
     first_key = due[0][0]
     assert due_session_events(rules, metadata, friday, {first_key}) == []
 
     changed_rules = copy.deepcopy(rules)
-    changed_rules["session_groups"]["forex_major"]["analysis_time"] = "08:46"
-    changed_time = datetime(2026, 6, 12, 8, 46, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+    changed_rules["session_groups"]["forex_major"]["analysis_time"] = "09:01"
+    changed_time = datetime(2026, 6, 12, 9, 1, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
     changed_due = due_session_events(changed_rules, metadata, changed_time, {first_key})
     assert any(event[1:] == ("forex_major", "analysis") for event in changed_due)
 

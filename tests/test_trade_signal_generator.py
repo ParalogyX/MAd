@@ -225,6 +225,7 @@ def test_scheduler_due_events_rules():
             for key, value in DEFAULT_SESSION_RULES["session_groups"].items()
         },
     }
+    rules["session_groups"]["forex_major"]["analysis_time"] = "08:45"
     rules["session_groups"]["crypto_24_7"]["enabled"] = False
     assert due_session_events(rules, metadata, friday, set()) != []
     assert all(event[1] != "crypto_24_7" for event in due_session_events(
