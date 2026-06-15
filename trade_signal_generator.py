@@ -1644,6 +1644,91 @@ def due_session_events(
     return due_events
 
 
+def due_session_events_since(
+    rules: dict[str, Any],
+    ticker_metadata: pd.DataFrame,
+    previous_timestamp: datetime,
+    current_timestamp: datetime,
+    executed_events: set[str],
+) -> list[tuple[datetime, str, str, str]]:
+    """Return events scheduled after previous_timestamp through current_timestamp.
+
+    The scheduler can spend several minutes inside analysis or CSV generation.
+    Checking an interval prevents exact-minute events from being skipped when
+    the loop is busy at the scheduled minute.
+    """
+
+    if current_timestamp < previous_timestamp:
+        previous_timestamp = current_timestamp - timedelta(minutes=1)
+
+    timezone_info = current_timestamp.tzinfo or ZoneInfo(DEFAULT_TIMEZONE)
+    start_date = previous_timestamp.astimezone(timezone_info).date()
+    end_date = current_timestamp.astimezone(timezone_info).date()
+    local_day = start_date
+    scheduled_events: list[tuple[datetime, str, str, str]] = []
+
+    while local_day <= end_date:
+        scheduled_events.extend(
+            scheduled_session_events_for_day(
+                rules=rules,
+                ticker_metadata=ticker_metadata,
+                local_day=local_day,
+                timezone_info=timezone_info,
+                executed_events=executed_events,
+            )
+        )
+        local_day += timedelta(days=1)
+
+    event_order = {"analysis": 0, "open": 1, "close": 2}
+    due_events = [
+        event
+        for event in scheduled_events
+        if previous_timestamp < event[0] <= current_timestamp
+    ]
+    return sorted(
+        due_events,
+        key=lambda event: (event[0], event_order.get(event[3], 99), event[2]),
+    )
+
+
+def scheduled_session_events_for_day(
+    rules: dict[str, Any],
+    ticker_metadata: pd.DataFrame,
+    local_day: date,
+    timezone_info: Any,
+    executed_events: set[str],
+) -> list[tuple[datetime, str, str, str]]:
+    """Return all scheduled events for one local day."""
+
+    events: list[tuple[datetime, str, str, str]] = []
+    for group_name, group_rule in rules.get("session_groups", {}).items():
+        if not group_rule.get("enabled", False):
+            continue
+        if not is_trading_day(str(group_rule.get("trading_days", "")), local_day):
+            continue
+        if tickers_for_group(ticker_metadata, group_name) == []:
+            continue
+
+        event_times = {
+            "analysis": str(group_rule["analysis_time"]),
+            "open": adjusted_open_event_time(
+                str(group_rule["open_time"]),
+                int(rules.get("entry_check_minutes_before_open", 0)),
+            ),
+            "close": str(group_rule["close_time"]),
+        }
+        for event_type, event_time in event_times.items():
+            scheduled_at = datetime.combine(
+                local_day,
+                parse_hhmm(event_time),
+                tzinfo=timezone_info,
+            )
+            event_key = f"{local_day}:{group_name}:{event_type}:{event_time}"
+            if event_key not in executed_events:
+                events.append((scheduled_at, event_key, group_name, event_type))
+    return events
+
+
 def execute_due_event(
     group_name: str,
     event_type: str,
@@ -1912,6 +1997,10 @@ def main() -> None:
 
     print("trade_signal_generator.py is ready.", flush=True)
     print_console_ready()
+    last_schedule_check = (
+        datetime.now(rules_timezone(rules)).replace(second=0, microsecond=0)
+        - timedelta(minutes=1)
+    )
 
     while True:
         timeout = min(60, int(rules.get("rules_reload_interval_seconds", 60)))
@@ -1969,27 +2058,18 @@ def main() -> None:
 
         timezone_info = rules_timezone(rules)
         local_timestamp = datetime.now(timezone_info).replace(second=0, microsecond=0)
-        due_events = due_session_events(
+        previous_schedule_check = last_schedule_check.astimezone(timezone_info)
+        due_events = due_session_events_since(
             rules,
             ticker_metadata,
+            previous_schedule_check,
             local_timestamp,
             executed_events,
         )
-        close_events = [event for event in due_events if event[2] == "close"]
-        non_close_events = [event for event in due_events if event[2] != "close"]
+        close_events = [event for event in due_events if event[3] == "close"]
+        non_close_events = [event for event in due_events if event[3] != "close"]
 
-        if close_events:
-            close_groups = [group_name for _, group_name, _ in close_events]
-            try:
-                run_close_results_for_groups(close_groups, rules, local_timestamp)
-            except Exception as exc:
-                LOGGER.exception("Scheduled close-result generation failed")
-                print(f"ERROR writing close results: {exc}", flush=True)
-            for event_key, _, _ in close_events:
-                executed_events.add(event_key)
-            action_completed = True
-
-        for event_key, group_name, event_type in non_close_events:
+        for _, event_key, group_name, event_type in non_close_events:
             try:
                 execute_due_event(
                     group_name,
@@ -2004,8 +2084,20 @@ def main() -> None:
             executed_events.add(event_key)
             action_completed = True
 
+        if close_events:
+            close_groups = [group_name for _, _, group_name, _ in close_events]
+            try:
+                run_close_results_for_groups(close_groups, rules, local_timestamp)
+            except Exception as exc:
+                LOGGER.exception("Scheduled close-result generation failed")
+                print(f"ERROR writing close results: {exc}", flush=True)
+            for _, event_key, _, _ in close_events:
+                executed_events.add(event_key)
+            action_completed = True
+
         if action_completed:
             print_console_ready()
+        last_schedule_check = local_timestamp
 
 
 def _safe_read_existing_metadata() -> pd.DataFrame:

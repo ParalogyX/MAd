@@ -18,6 +18,7 @@ from trade_signal_generator import (
     classify_ticker_from_metadata,
     convert_exchange_session_to_local,
     due_session_events,
+    due_session_events_since,
     is_entry_price_still_valid,
     load_classification_overrides,
     load_mt5_symbol_sessions,
@@ -259,6 +260,54 @@ def test_scheduler_due_events_rules():
         {executed_key},
     )
     assert any(event[1:] == ("forex_major", "analysis") for event in changed_due)
+
+
+def test_scheduler_catches_event_missed_while_busy():
+    metadata = pd.DataFrame(
+        [
+            {"ticker": "BTCUSD", "session_group": "crypto_24_7"},
+            {"ticker": "AAPL", "session_group": "us_stock_index"},
+        ]
+    )
+    local_zone = ZoneInfo("Europe/Amsterdam")
+    rules = copy.deepcopy(DEFAULT_SESSION_RULES)
+    for group_name, group_rule in rules["session_groups"].items():
+        group_rule["enabled"] = group_name in {"crypto_24_7", "us_stock_index"}
+    rules["session_groups"]["crypto_24_7"]["open_time"] = "15:10"
+
+    previous_check = datetime(2026, 6, 12, 15, 9, tzinfo=local_zone)
+    current_check = datetime(2026, 6, 12, 15, 12, tzinfo=local_zone)
+
+    assert due_session_events(rules, metadata, current_check, set()) == []
+
+    missed_events = due_session_events_since(
+        rules,
+        metadata,
+        previous_check,
+        current_check,
+        set(),
+    )
+
+    assert any(
+        event[2:] == ("crypto_24_7", "open")
+        and event[0] == datetime(2026, 6, 12, 15, 10, tzinfo=local_zone)
+        for event in missed_events
+    )
+    executed_key = next(
+        event[1]
+        for event in missed_events
+        if event[2:] == ("crypto_24_7", "open")
+    )
+    assert all(
+        event[2:] != ("crypto_24_7", "open")
+        for event in due_session_events_since(
+            rules,
+            metadata,
+            previous_check,
+            current_check,
+            {executed_key},
+        )
+    )
 
 
 def test_entry_price_validation():
