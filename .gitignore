@@ -10,5 +10,6 @@ trade_plans/
 Results/
 *.json
 *.log
+*.sqlite3
 .env
 notes

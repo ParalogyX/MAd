@@ -1,8 +1,4 @@
-"""Session-aware scheduled signal and trade-plan generation.
-
-This script analyses symbols and writes CSV files only. It does not place
-orders, connect to broker execution APIs, size positions, or submit trades.
-"""
+"""Session-aware signal, trade-plan, and MT5 execution scheduler."""
 
 from __future__ import annotations
 
@@ -37,11 +33,14 @@ from investment_adviser.providers.mt5 import (
 from runtime_paths import (
     best_signals_dir,
     ensure_runtime_directories,
+    execution_ledger_path,
     logs_dir,
     results_dir,
     trade_plans_dir,
 )
 from scheduler_config import (
+    ALLOW_LIVE_TRADING,
+    AUTO_TRADE_ENABLED,
     CLASSIFICATION_OVERRIDES_FILE,
     DAY_TO_INDEX,
     DEFAULT_MT5_HOST,
@@ -54,7 +53,9 @@ from scheduler_config import (
     LOG_PREFIX,
     LOG_RETENTION_DAYS,
     METADATA_COLUMNS,
+    MT5_STRATEGY_MAGIC,
     MT5_SYMBOL_SESSIONS_FILE,
+    MT5_TEST_MAGIC,
     OUTPUT_DIR,
     QUIT_COMMAND,
     RELOAD_COMMAND,
@@ -63,10 +64,15 @@ from scheduler_config import (
     SIGNALS_ALIAS,
     SIGNALS_COMMAND,
     STATUS_COMMAND,
+    TARGET_TRADE_NOTIONAL_EUR,
+    TEST_TRADE_COMMAND,
+    TEST_TRADE_HOLD_SECONDS,
+    TEST_TRADE_NOTIONAL_EUR,
     TICKER_TRADING_TIMES_FILE,
     TRADE_PLAN_COLUMNS,
     TRIGGER_COMMAND,
     UPDATE_COMMAND,
+    EXECUTION_LEDGER_FILE,
 )
 from scheduler_logging import (
     LOGGER,
@@ -77,6 +83,12 @@ from scheduler_logging import (
     timed_task,
 )
 import ticker_classification_rules as classification_rules
+from mt5_execution import (
+    close_trade_plan_file_safely,
+    execute_trade_plan_file_safely,
+    recover_stale_test_trades_safely,
+    start_test_trade_safely,
+)
 
 
 def print_command_help() -> None:
@@ -109,6 +121,13 @@ def print_command_help() -> None:
         f"  {SIGNALS_COMMAND:<7} Generate final trade-plan CSV files now for all "
         "enabled groups that already have a today's best_signals_<group>_*.csv "
         f"candidate file. Alias: {SIGNALS_ALIAS}.",
+        flush=True,
+    )
+    print(
+        f"  {TEST_TRADE_COMMAND:<7} Run a demo-only MT5 connectivity test: open an "
+        f"approximately EUR {TEST_TRADE_NOTIONAL_EUR:.0f} BTCUSD buy position, "
+        f"wait {TEST_TRADE_HOLD_SECONDS} seconds in a background thread, then "
+        "close exactly that test position.",
         flush=True,
     )
     print(
@@ -1063,6 +1082,15 @@ def run_trade_plan_for_group(
             f"to {output_path.name}.",
             flush=True,
         )
+        LOGGER.info(
+            "PLAN_SAVED session_group=%s path=%s rows=%s auto_trade_enabled=%s",
+            session_group,
+            output_path,
+            len(rows),
+            AUTO_TRADE_ENABLED,
+        )
+        if rows:
+            execute_trade_plan_file_safely(output_path)
         return output_path
 
 
@@ -1126,6 +1154,7 @@ def run_close_results_for_groups(
         timezone_info = rules_timezone(rules)
         close_timestamp = local_timestamp.astimezone(timezone_info)
         trade_plans: list[pd.DataFrame] = []
+        trade_plan_paths: list[Path] = []
         for group_name in session_groups:
             try:
                 plan_path = find_latest_trade_plan_file(
@@ -1141,10 +1170,14 @@ def run_close_results_for_groups(
                 continue
             with timed_task("load_trade_plan_csv", path=plan_path):
                 trade_plans.append(pd.read_csv(plan_path))
+            trade_plan_paths.append(plan_path)
 
         if not trade_plans:
             print("No trade plan rows found for close result generation.", flush=True)
             return None
+
+        for plan_path in trade_plan_paths:
+            close_trade_plan_file_safely(plan_path)
 
         combined = pd.concat(trade_plans, ignore_index=True)
         rows = build_close_result_rows(
@@ -1770,6 +1803,17 @@ def print_status(
     print(f"Best signals directory: {best_signals_dir(OUTPUT_DIR)}", flush=True)
     print(f"Trade plans directory: {trade_plans_dir(OUTPUT_DIR)}", flush=True)
     print(f"Results directory: {results_dir(OUTPUT_DIR)}", flush=True)
+    print(
+        f"Execution ledger: {execution_ledger_path(OUTPUT_DIR, EXECUTION_LEDGER_FILE)}",
+        flush=True,
+    )
+    print(
+        "Auto trading: "
+        f"enabled={AUTO_TRADE_ENABLED}, allow_live_trading={ALLOW_LIVE_TRADING}, "
+        f"target_notional_eur={TARGET_TRADE_NOTIONAL_EUR}, "
+        f"strategy_magic={MT5_STRATEGY_MAGIC}, test_magic={MT5_TEST_MAGIC}",
+        flush=True,
+    )
     if isinstance(mt5_rules, dict):
         print(
             f"MT5 server: {mt5_rules.get('host')}:{mt5_rules.get('port')}",
@@ -1963,6 +2007,17 @@ def main() -> None:
     print(f"Results directory: {results_dir(OUTPUT_DIR)}", flush=True)
     print(f"Logs directory: {logs_dir(OUTPUT_DIR)}", flush=True)
     print(f"Log file: {log_path}", flush=True)
+    print(
+        f"Execution ledger: {execution_ledger_path(OUTPUT_DIR, EXECUTION_LEDGER_FILE)}",
+        flush=True,
+    )
+    print(
+        "MT5 execution: "
+        f"auto_trade_enabled={AUTO_TRADE_ENABLED}, "
+        f"allow_live_trading={ALLOW_LIVE_TRADING}, "
+        f"target_notional_eur={TARGET_TRADE_NOTIONAL_EUR}",
+        flush=True,
+    )
     LOGGER.info("Starting trade_signal_generator.py")
 
     commands: queue.Queue[str] = queue.Queue()
@@ -1993,6 +2048,8 @@ def main() -> None:
         f"Startup metadata ready: {len(ticker_metadata)} tickers loaded.",
         flush=True,
     )
+    print("Checking for stale bot-owned test trades to recover...", flush=True)
+    recover_stale_test_trades_safely()
     executed_events: set[str] = set()
 
     print("trade_signal_generator.py is ready.", flush=True)
@@ -2043,6 +2100,12 @@ def main() -> None:
                     except Exception as exc:
                         LOGGER.exception("Manual signals command failed")
                         print(f"ERROR generating trade plans: {exc}", flush=True)
+                elif normalized_command == TEST_TRADE_COMMAND:
+                    try:
+                        start_test_trade_safely()
+                    except Exception as exc:
+                        LOGGER.exception("test_trade command failed")
+                        print(f"ERROR running test_trade: {exc}", flush=True)
                 else:
                     print("unknown command", flush=True)
             print_console_ready()

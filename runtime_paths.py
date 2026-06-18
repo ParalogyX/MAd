@@ -10,6 +10,7 @@ LOG_DIR_ENV_VAR = "M_AD_LOG_DIR"
 BEST_SIGNALS_DIR_ENV_VAR = "M_AD_BEST_SIGNALS_DIR"
 TRADE_PLANS_DIR_ENV_VAR = "M_AD_TRADE_PLANS_DIR"
 RESULTS_DIR_ENV_VAR = "M_AD_RESULTS_DIR"
+EXECUTION_LEDGER_ENV_VAR = "M_AD_EXECUTION_LEDGER"
 
 LOG_DIR_NAME = "logs"
 BEST_SIGNALS_DIR_NAME = "Best signals"
@@ -57,6 +58,18 @@ def results_dir(root: Path | None = None) -> Path:
     if configured:
         return Path(configured).expanduser()
     return (root or output_root()) / RESULTS_DIR_NAME
+
+
+def execution_ledger_path(
+    root: Path | None = None,
+    filename: str = "execution_ledger.sqlite3",
+) -> Path:
+    """Return the persistent MT5 execution-ledger path."""
+
+    configured = os.getenv(EXECUTION_LEDGER_ENV_VAR)
+    if configured:
+        return Path(configured).expanduser()
+    return (root or output_root()) / filename
 
 
 def signals_path(root: Path | None = None) -> Path:

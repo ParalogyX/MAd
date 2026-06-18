@@ -1,6 +1,6 @@
 # Investment Adviser
 
-`investment_adviser` is the first iteration of a Python investment analysis library. It provides clean provider interfaces for market data, technical indicators, candlestick pattern detection, and symbol sentiment analysis. It does not place trades, log in to brokers, or produce financial advice.
+`investment_adviser` is a Python investment analysis library plus scheduler scripts for signal generation. It provides clean provider interfaces for market data, technical indicators, candlestick pattern detection, and symbol sentiment analysis. The optional scheduler execution layer can submit MT5 orders from generated Trade Plan files when automated trading is enabled; the core library still does not produce financial advice.
 
 ## What It Does
 
@@ -88,6 +88,69 @@ In attached console mode, type `now` to run immediately or `stop` to stop the
 scheduler. Detach from the container without stopping it with `Ctrl-p` then
 `Ctrl-q`. If you stop it from the console, start it again with
 `docker compose up -d`.
+
+## MT5 Order Execution
+
+`trade_signal_generator.py` now keeps the existing CSV workflow and adds an
+execution step after a valid Trade Plan CSV is saved. Each Trade Plan row is
+processed once through MT5:
+
+- buy rows open MT5 buy positions at ask; sell rows open MT5 sell positions at bid;
+- Stop Loss and Take Profit are read from the Trade Plan and are not recalculated;
+- normal strategy trades target approximately `TARGET_TRADE_NOTIONAL_EUR = 1000`;
+- the target is gross market exposure, not MT5 margin, so leverage is not used to scale the trade;
+- volume is calculated from symbol contract size, current price, broker lot limits, and EUR conversion rates from MT5 symbols;
+- if minimum lot size would exceed the requested exposure, the trade is skipped;
+- with `ALLOW_LIVE_TRADING = False`, normal execution refuses non-demo accounts.
+
+Execution settings are hardcoded Python configuration in
+`scheduler_config.py` and can be overridden with environment variables:
+
+```text
+M_AD_AUTO_TRADE_ENABLED=true
+M_AD_ALLOW_LIVE_TRADING=false
+M_AD_TARGET_TRADE_NOTIONAL_EUR=1000
+M_AD_TEST_TRADE_NOTIONAL_EUR=50
+M_AD_TEST_TRADE_HOLD_SECONDS=60
+M_AD_MT5_STRATEGY_MAGIC=26061801
+M_AD_MT5_TEST_MAGIC=26061802
+M_AD_MT5_TEST_SYMBOL=BTCUSD
+```
+
+The persistent execution ledger is stored beside runtime files as:
+
+```text
+execution_ledger.sqlite3
+```
+
+It records plan ID, source Trade Plan, symbol, direction, planned SL/TP,
+requested and actual volume, estimated exposure, MT5 order/deal/position
+tickets, status, failure reason, open/close timestamps, close price, and
+realised broker result fields when available. The ledger is used before every
+send to prevent duplicate positions after retries or restarts.
+
+At session close, the scheduler first attempts to close only bot-owned open
+positions identified by ledger, magic number, position ticket, and order
+comment. Manual or unrelated positions are not closed. The existing analytical
+`Results` CSV generation then runs as before.
+
+### Demo Test Trade
+
+Attach to the running scheduler console and type:
+
+```text
+test_trade
+```
+
+The command is demo-only. It confirms the MT5 account trade mode is demo,
+resolves BTCUSD including broker suffixes, opens an approximately EUR 50 buy
+position, waits 60 seconds by default in a background thread, then closes the
+exact test position. A second `test_trade` while one is running is rejected.
+
+Common execution failures are written to the daily log in `logs/`, including
+AutoTrading disabled, market closed, no tick, unsupported volume, invalid
+SL/TP, missing currency conversion, insufficient margin, broker rejection, and
+order-check/order-send retcodes.
 
 ## Basic Usage
 

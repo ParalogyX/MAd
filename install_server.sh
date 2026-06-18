@@ -160,6 +160,7 @@ main() {
     printf 'Best signals: %s/Best signals\n' "$DATA_DIR"
     printf 'Trade plans: %s/Trade plans\n' "$DATA_DIR"
     printf 'Results: %s/Results\n' "$DATA_DIR"
+    printf 'Execution ledger: %s/execution_ledger.sqlite3\n' "$DATA_DIR"
     printf 'Editable session rules: %s/session_rules.json\n' "$DATA_DIR"
     printf 'MT5 bridge default: %s:%s\n' "$MT5_HOST" "$MT5_PORT"
     printf 'View logs with: cd %s && %s logs -f %s\n' \

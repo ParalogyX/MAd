@@ -29,6 +29,32 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    """Return a float environment value, falling back on invalid input."""
+
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    """Return a boolean environment value from common true/false strings."""
+
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = output_root(PROJECT_ROOT)
 
@@ -46,6 +72,7 @@ RELOAD_COMMAND = "reload"
 STATUS_COMMAND = "status"
 SIGNALS_COMMAND = "signals"
 SIGNALS_ALIAS = "sig"
+TEST_TRADE_COMMAND = "test_trade"
 QUIT_COMMAND = "quit"
 LEGACY_EXIT_COMMAND = "stop"
 
@@ -53,6 +80,20 @@ DEFAULT_TIMEZONE = "Europe/Amsterdam"
 DEFAULT_MT5_HOST = os.getenv("MT5_HOST", MT5_DEFAULT_HOST)
 DEFAULT_MT5_PORT = env_int("MT5_PORT", MT5_DEFAULT_PORT)
 DEFAULT_MT5_MAX_BARS = env_int("MT5_MAX_BARS", MT5_DEFAULT_MAX_BARS)
+
+AUTO_TRADE_ENABLED = env_bool("M_AD_AUTO_TRADE_ENABLED", True)
+ALLOW_LIVE_TRADING = env_bool("M_AD_ALLOW_LIVE_TRADING", False)
+TARGET_TRADE_NOTIONAL_EUR = env_float("M_AD_TARGET_TRADE_NOTIONAL_EUR", 1000.0)
+TEST_TRADE_NOTIONAL_EUR = env_float("M_AD_TEST_TRADE_NOTIONAL_EUR", 50.0)
+TEST_TRADE_HOLD_SECONDS = env_int("M_AD_TEST_TRADE_HOLD_SECONDS", 60)
+MT5_STRATEGY_MAGIC = env_int("M_AD_MT5_STRATEGY_MAGIC", 26061801)
+MT5_TEST_MAGIC = env_int("M_AD_MT5_TEST_MAGIC", 26061802)
+MT5_TEST_SYMBOL = os.getenv("M_AD_MT5_TEST_SYMBOL", "BTCUSD")
+APP_ORDER_COMMENT_PREFIX = os.getenv("M_AD_ORDER_COMMENT_PREFIX", "MAd")
+EXECUTION_LEDGER_FILE = os.getenv(
+    "M_AD_EXECUTION_LEDGER_FILE",
+    "execution_ledger.sqlite3",
+)
 
 METADATA_COLUMNS = [
     "ticker",
