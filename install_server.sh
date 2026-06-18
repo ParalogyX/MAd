@@ -15,6 +15,11 @@ SERVICE_NAME="${SERVICE_NAME:-mad-signals}"
 MT5_HOST="${MT5_HOST:-127.0.0.1}"
 MT5_PORT="${MT5_PORT:-8001}"
 TZ="${TZ:-Europe/Amsterdam}"
+M_AD_AUTO_TRADE_ENABLED="${M_AD_AUTO_TRADE_ENABLED:-true}"
+M_AD_ALLOW_LIVE_TRADING="${M_AD_ALLOW_LIVE_TRADING:-false}"
+M_AD_TARGET_TRADE_NOTIONAL_EUR="${M_AD_TARGET_TRADE_NOTIONAL_EUR:-1000}"
+M_AD_TEST_TRADE_NOTIONAL_EUR="${M_AD_TEST_TRADE_NOTIONAL_EUR:-50}"
+M_AD_TEST_TRADE_HOLD_SECONDS="${M_AD_TEST_TRADE_HOLD_SECONDS:-60}"
 SUDO_CMD=()
 
 log() {
@@ -129,6 +134,11 @@ M_AD_DATA_DIR=$DATA_DIR
 MT5_HOST=$MT5_HOST
 MT5_PORT=$MT5_PORT
 TZ=$TZ
+M_AD_AUTO_TRADE_ENABLED=$M_AD_AUTO_TRADE_ENABLED
+M_AD_ALLOW_LIVE_TRADING=$M_AD_ALLOW_LIVE_TRADING
+M_AD_TARGET_TRADE_NOTIONAL_EUR=$M_AD_TARGET_TRADE_NOTIONAL_EUR
+M_AD_TEST_TRADE_NOTIONAL_EUR=$M_AD_TEST_TRADE_NOTIONAL_EUR
+M_AD_TEST_TRADE_HOLD_SECONDS=$M_AD_TEST_TRADE_HOLD_SECONDS
 EOF
 }
 
@@ -145,10 +155,15 @@ main() {
     export MT5_HOST
     export MT5_PORT
     export TZ
+    export M_AD_AUTO_TRADE_ENABLED
+    export M_AD_ALLOW_LIVE_TRADING
+    export M_AD_TARGET_TRADE_NOTIONAL_EUR
+    export M_AD_TEST_TRADE_NOTIONAL_EUR
+    export M_AD_TEST_TRADE_HOLD_SECONDS
     write_compose_env_file
 
     log "Building Docker image"
-    "${COMPOSE_CMD[@]}" build
+    DOCKER_BUILDKIT=0 COMPOSE_DOCKER_CLI_BUILD=0 "${COMPOSE_CMD[@]}" build --no-cache
 
     log "Starting $SERVICE_NAME container"
     "${COMPOSE_CMD[@]}" up -d
@@ -163,6 +178,9 @@ main() {
     printf 'Execution ledger: %s/execution_ledger.sqlite3\n' "$DATA_DIR"
     printf 'Editable session rules: %s/session_rules.json\n' "$DATA_DIR"
     printf 'MT5 bridge default: %s:%s\n' "$MT5_HOST" "$MT5_PORT"
+    printf 'Auto trading enabled: %s\n' "$M_AD_AUTO_TRADE_ENABLED"
+    printf 'Live trading allowed: %s\n' "$M_AD_ALLOW_LIVE_TRADING"
+    printf 'Target trade notional EUR: %s\n' "$M_AD_TARGET_TRADE_NOTIONAL_EUR"
     printf 'View logs with: cd %s && %s logs -f %s\n' \
         "$APP_DIR" "${COMPOSE_CMD[*]}" "$SERVICE_NAME"
     printf 'Attach console with: cd %s && %s attach %s\n' \

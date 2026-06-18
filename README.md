@@ -117,6 +117,11 @@ M_AD_MT5_TEST_MAGIC=26061802
 M_AD_MT5_TEST_SYMBOL=BTCUSD
 ```
 
+Docker deployment writes these values into the generated `.env` file and passes
+them into the container. Defaults keep live-account execution disabled; set
+`M_AD_ALLOW_LIVE_TRADING=true` only when you intentionally want the scheduler
+to trade a non-demo account.
+
 The persistent execution ledger is stored beside runtime files as:
 
 ```text
@@ -143,9 +148,12 @@ test_trade
 ```
 
 The command is demo-only. It confirms the MT5 account trade mode is demo,
-resolves BTCUSD including broker suffixes, opens an approximately EUR 50 buy
-position, waits 60 seconds by default in a background thread, then closes the
-exact test position. A second `test_trade` while one is running is rejected.
+tries the configured test symbol first, and rejects symbols whose broker
+minimum lot would exceed the EUR 50 test cap. If the configured symbol is too
+large, it selects a suitable fallback test symbol, opens an approximately
+EUR 50 buy position, waits 60 seconds by default in a background thread, then
+closes the exact test position. A second `test_trade` while one is running is
+rejected.
 
 Common execution failures are written to the daily log in `logs/`, including
 AutoTrading disabled, market closed, no tick, unsupported volume, invalid

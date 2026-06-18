@@ -85,9 +85,11 @@ from scheduler_logging import (
 import ticker_classification_rules as classification_rules
 from mt5_execution import (
     close_trade_plan_file_safely,
+    default_test_trade_manager,
     execute_trade_plan_file_safely,
     recover_stale_test_trades_safely,
     start_test_trade_safely,
+    test_trade_status,
 )
 
 
@@ -1814,6 +1816,16 @@ def print_status(
         f"strategy_magic={MT5_STRATEGY_MAGIC}, test_magic={MT5_TEST_MAGIC}",
         flush=True,
     )
+    test_status = test_trade_status()
+    print(
+        "Test trade: "
+        f"state={test_status.get('state')}, "
+        f"active={test_status.get('active')}, "
+        f"last_stage={test_status.get('last_stage')}, "
+        f"failure={test_status.get('failure_reason') or ''}, "
+        f"position={test_status.get('position_ticket') or ''}",
+        flush=True,
+    )
     if isinstance(mt5_rules, dict):
         print(
             f"MT5 server: {mt5_rules.get('host')}:{mt5_rules.get('port')}",
@@ -1973,8 +1985,11 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=[UPDATE_COMMAND],
-        help="Optional one-shot command. Use 'update' to refresh ticker metadata.",
+        choices=[UPDATE_COMMAND, TEST_TRADE_COMMAND],
+        help=(
+            "Optional one-shot command. Use 'update' to refresh ticker metadata "
+            "or 'test_trade' to run the demo-only MT5 test trade."
+        ),
     )
     parser.add_argument(
         "--debug-symbol",
@@ -1996,6 +2011,20 @@ def main() -> None:
         )
         with timed_task("one_shot_update_command"):
             update_ticker_trading_times(debug_symbol=args.debug_symbol)
+        return
+    if args.command == TEST_TRADE_COMMAND:
+        ensure_runtime_directories(OUTPUT_DIR)
+        log_path = setup_logging()
+        print(f"Logging to {log_path}", flush=True)
+        rules = load_session_rules()
+        print(
+            f"Using MT5 server {rules['mt5']['host']}:{rules['mt5']['port']}",
+            flush=True,
+        )
+        recover_stale_test_trades_safely()
+        with timed_task("one_shot_test_trade_command"):
+            default_test_trade_manager().run_blocking()
+        print("test_trade one-shot command finished.", flush=True)
         return
 
     ensure_runtime_directories(OUTPUT_DIR)

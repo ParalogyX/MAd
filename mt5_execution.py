@@ -8,7 +8,9 @@ rejects an order or the bridge is unavailable.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import queue
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -41,6 +43,11 @@ FINAL_STATUSES = {"opened", "opened_partial", "closed", "failed", "skipped"}
 OPEN_STATUSES = {"opened", "opened_partial"}
 SUCCESS_RETCODES = {0, 10008, 10009, 10010}
 TRANSIENT_RETCODES = {10004, 10012, 10020, 10021}
+TEST_TRADE_STATUS_FILE = "test_trade_status.json"
+TEST_TRADE_OPERATION_TIMEOUT_SECONDS = 30
+TEST_TRADE_OPEN_VERIFY_SECONDS = 15
+TEST_TRADE_CLOSE_VERIFY_SECONDS = 20
+TEST_TRADE_WATCHDOG_EXTRA_SECONDS = 180
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,45 @@ class ExecutionOutcome:
 
 class ExecutionError(RuntimeError):
     """Controlled order-execution failure."""
+
+
+class OperationTimeoutError(ExecutionError):
+    """Raised when an MT5/RPyC operation does not finish in time."""
+
+
+class TestTradeStatusStore:
+    """Small JSON status store for console status and crash recovery hints."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or (OUTPUT_DIR / TEST_TRADE_STATUS_FILE)
+
+    def write(self, **values: Any) -> None:
+        """Persist test-trade state without credentials."""
+
+        payload = self.read()
+        payload.update(values)
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def read(self) -> dict[str, Any]:
+        """Read the last known status, returning idle on missing/corrupt JSON."""
+
+        if not self.path.exists():
+            return {
+                "state": "idle",
+                "last_stage": "",
+                "failure_reason": "",
+            }
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {
+                "state": "idle",
+                "last_stage": "",
+                "failure_reason": "status file unreadable",
+            }
+        return data if isinstance(data, dict) else {"state": "idle"}
 
 
 class MT5TradeExecutor(MT5BaseProvider):
@@ -292,7 +338,6 @@ class MT5TradeExecutor(MT5BaseProvider):
             requested_volume=volume_calc.volume,
             estimated_actual_exposure=volume_calc.estimated_actual_exposure_eur,
         )
-        self.order_check(client, request, order)
         LOGGER.info(
             "ORDER_SEND_STARTED plan_id=%s symbol=%s volume=%s price=%s sl=%s tp=%s",
             order.plan_id,
@@ -302,9 +347,13 @@ class MT5TradeExecutor(MT5BaseProvider):
             stop_loss,
             take_profit,
         )
-        result = send_order(client, request)
-        if not is_success_retcode(client, result):
-            raise ExecutionError(f"order_send failed: {describe_mt5_result(client, result)}")
+        request, result = self.send_checked_order_with_filling_fallback(
+            client=client,
+            request=request,
+            symbol_info=symbol_info,
+            order=order,
+            action="open",
+        )
 
         actual_volume = _numeric(get_result_value(result, "volume")) or volume_calc.volume
         actual_price = _numeric(get_result_value(result, "price")) or price
@@ -422,6 +471,7 @@ class MT5TradeExecutor(MT5BaseProvider):
         side = "sell" if order.direction == "buy" else "buy"
         tick = require_tick(client, symbol_name)
         price = select_tick_price(tick, side)
+        symbol_info = require_symbol_info(client, symbol_name)
         close_request = build_close_request(
             client=client,
             symbol=symbol_name,
@@ -432,15 +482,18 @@ class MT5TradeExecutor(MT5BaseProvider):
             or _ticket_text(record.get("mt5_position_ticket")),
             magic=self.settings.strategy_magic,
             comment=self.order_comment(order.plan_id, test=False),
-            filling_mode=choose_filling_mode(client, require_symbol_info(client, symbol_name)),
+            filling_mode=choose_filling_mode(client, symbol_info),
             deviation=self.settings.max_deviation_points,
         )
         if close_request["volume"] <= 0:
             raise ExecutionError(f"Invalid close volume for {symbol_name}.")
-        self.order_check(client, close_request, order)
-        result = send_order(client, close_request)
-        if not is_success_retcode(client, result):
-            raise ExecutionError(f"close order_send failed: {describe_mt5_result(client, result)}")
+        close_request, result = self.send_checked_order_with_filling_fallback(
+            client=client,
+            request=close_request,
+            symbol_info=symbol_info,
+            order=order,
+            action="close",
+        )
 
         closing_price = _numeric(get_result_value(result, "price")) or price
         closing_deal = _ticket_text(get_result_value(result, "deal"))
@@ -480,6 +533,24 @@ class MT5TradeExecutor(MT5BaseProvider):
         if not hasattr(client, "order_check"):
             LOGGER.info("ORDER_CHECK_SKIPPED plan_id=%s reason=not_supported", order.plan_id)
             return
+        result = self.order_check_result(client, request, order)
+        if result is None:
+            return
+        if not is_success_retcode(client, result, include_check_success=True):
+            raise ExecutionError(f"order_check failed: {describe_mt5_result(client, result)}")
+        LOGGER.info("ORDER_CHECK_PASSED plan_id=%s symbol=%s", order.plan_id, order.symbol)
+
+    def order_check_result(
+        self,
+        client: Any,
+        request: dict[str, Any],
+        order: TradePlanOrder,
+    ) -> Any | None:
+        """Run MT5 order_check and return the raw result when supported."""
+
+        if not hasattr(client, "order_check"):
+            LOGGER.info("ORDER_CHECK_SKIPPED plan_id=%s reason=not_supported", order.plan_id)
+            return None
         result = client.order_check(request)
         LOGGER.info(
             "ORDER_CHECK_RESULT plan_id=%s symbol=%s result=%s",
@@ -487,9 +558,70 @@ class MT5TradeExecutor(MT5BaseProvider):
             request.get("symbol"),
             describe_mt5_result(client, result),
         )
-        if not is_success_retcode(client, result, include_check_success=True):
-            raise ExecutionError(f"order_check failed: {describe_mt5_result(client, result)}")
-        LOGGER.info("ORDER_CHECK_PASSED plan_id=%s symbol=%s", order.plan_id, order.symbol)
+        return result
+
+    def send_checked_order_with_filling_fallback(
+        self,
+        *,
+        client: Any,
+        request: dict[str, Any],
+        symbol_info: Any,
+        order: TradePlanOrder,
+        action: str,
+    ) -> tuple[dict[str, Any], Any]:
+        """Send a checked order, retrying only unsupported MT5 filling modes."""
+
+        last_result: Any | None = None
+        last_check: Any | None = None
+        for filling_mode in candidate_filling_modes(client, symbol_info, request.get("type_filling")):
+            attempt = dict(request)
+            attempt["type_filling"] = filling_mode
+            LOGGER.info(
+                "ORDER_REQUEST plan_id=%s action=%s request=%s",
+                order.plan_id,
+                action,
+                safe_request_log(attempt),
+            )
+            check_result = self.order_check_result(client, attempt, order)
+            last_check = check_result
+            if check_result is not None and not is_success_retcode(
+                client,
+                check_result,
+                include_check_success=True,
+            ):
+                if is_unsupported_filling_retcode(client, check_result):
+                    LOGGER.info(
+                        "ORDER_FILLING_RETRY plan_id=%s action=%s type_filling=%s "
+                        "reason=unsupported_order_check",
+                        order.plan_id,
+                        action,
+                        filling_mode,
+                    )
+                    continue
+                raise ExecutionError(
+                    f"{action} order_check failed: {describe_mt5_result(client, check_result)}"
+                )
+
+            result = send_order(client, attempt)
+            last_result = result
+            if is_success_retcode(client, result):
+                return attempt, result
+            if is_unsupported_filling_retcode(client, result):
+                LOGGER.info(
+                    "ORDER_FILLING_RETRY plan_id=%s action=%s type_filling=%s "
+                    "reason=unsupported_order_send",
+                    order.plan_id,
+                    action,
+                    filling_mode,
+                )
+                continue
+            raise ExecutionError(
+                f"{action} order_send failed: {describe_mt5_result(client, result)}"
+            )
+        raise ExecutionError(
+            f"{action} order_send failed for all filling modes: "
+            f"{describe_mt5_result(client, last_result or last_check)}"
+        )
 
     def validate_environment(self, client: Any, require_demo: bool) -> None:
         """Validate connection, account, and live-account safety settings."""
@@ -534,6 +666,7 @@ class TestTradeManager:
         settings: ExecutionSettings | None = None,
         ledger: ExecutionLedger | None = None,
         client_factory: Any | None = None,
+        status_store: TestTradeStatusStore | None = None,
     ) -> None:
         self.settings = settings or ExecutionSettings()
         self.ledger = ledger or ExecutionLedger(
@@ -542,48 +675,175 @@ class TestTradeManager:
         self.client_factory = client_factory
         self._lock = threading.Lock()
         self._active = False
+        self._worker: threading.Thread | None = None
+        self._started_at: datetime | None = None
+        self._state = "idle"
+        self._last_stage = ""
+        self._failure_reason = ""
+        self._position_ticket: str | None = None
+        self._plan_id: str | None = None
+        self.status_store = status_store or TestTradeStatusStore()
+        self.status_store.write(state="idle", last_stage="", failure_reason="")
 
     def start(self) -> bool:
         """Start the test trade in a daemon thread if none is active."""
 
         with self._lock:
-            if self._active:
+            self._repair_stale_state_locked()
+            if self._is_active_locked():
+                LOGGER.info(
+                    "TEST_TRADE_FAILED reason=already_running state=%s stage=%s",
+                    self._state,
+                    self._last_stage,
+                )
                 return False
+            self._state = "starting"
+            self._last_stage = "TEST_TRADE_WORKER_STARTING"
+            self._failure_reason = ""
+            self._started_at = datetime.now(timezone.utc)
+            self._write_status_locked()
+        LOGGER.info("TEST_TRADE_WORKER_STARTING")
+        thread = threading.Thread(
+            target=self._run_and_release,
+            name="mad-test-trade",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception as exc:
+            LOGGER.exception("TEST_TRADE_FAILED stage=TEST_TRADE_WORKER_STARTING")
+            with self._lock:
+                self._active = False
+                self._worker = None
+                self._state = "failed"
+                self._failure_reason = str(exc)
+                self._write_status_locked()
+            return False
+        with self._lock:
+            self._worker = thread
             self._active = True
-        thread = threading.Thread(target=self._run_and_release, daemon=True)
-        thread.start()
+            self._last_stage = "TEST_TRADE_WORKER_STARTED"
+            self._write_status_locked()
+        LOGGER.info("TEST_TRADE_WORKER_STARTED thread=%s", thread.name)
         return True
 
     def _run_and_release(self) -> None:
         try:
             self.run_blocking()
+        except Exception as exc:
+            LOGGER.exception(
+                "TEST_TRADE_FAILED stage=%s reason=%s",
+                self._last_stage or "unknown",
+                exc,
+            )
+            with self._lock:
+                self._state = "failed"
+                self._failure_reason = str(exc)
+                self._write_status_locked()
         finally:
             with self._lock:
                 self._active = False
+                self._worker = None
+                if self._state not in {"completed", "failed"}:
+                    self._state = "failed"
+                    self._failure_reason = self._failure_reason or "worker exited unexpectedly"
+                self._write_status_locked()
+            LOGGER.info("TEST_TRADE_STATE_CLEARED")
+
+    def status(self) -> dict[str, Any]:
+        """Return current test-trade status for console output."""
+
+        with self._lock:
+            self._repair_stale_state_locked()
+            status = self.status_store.read()
+            status.update(
+                {
+                    "state": self._state,
+                    "last_stage": self._last_stage,
+                    "failure_reason": self._failure_reason,
+                    "active": self._is_active_locked(),
+                    "position_ticket": self._position_ticket,
+                    "plan_id": self._plan_id,
+                }
+            )
+            return status
 
     def run_blocking(self) -> ExecutionOutcome:
         """Open a small BTCUSD demo position and close it after the hold time."""
 
         LOGGER.info("TEST_TRADE_REQUESTED")
+        self._set_stage("TEST_TRADE_WORKER_ENTERED", "starting")
         executor = MT5TradeExecutor(
             settings=self.settings,
             ledger=self.ledger,
             client_factory=self.client_factory,
         )
-        client = executor._get_client()
-        account = call_optional(client, "account_info")
+        client: Any | None = None
+        symbol_name = ""
+        position_ticket: str | None = None
+        plan_id = ""
+        comment = ""
+        opened = False
+        try:
+            self._set_stage("TEST_TRADE_MT5_CONNECTION_CHECK_STARTED", "starting")
+            client = self._mt5_call(
+                "TEST_TRADE_MT5_CONNECTION_CHECK_STARTED",
+                executor._get_client,
+            )
+            self._set_stage("TEST_TRADE_MT5_CONNECTION_CONFIRMED", "starting")
+            self._set_stage("TEST_TRADE_ACCOUNT_CHECK_STARTED", "validating")
+            terminal = self._mt5_call(
+                "TEST_TRADE_TERMINAL_INFO",
+                lambda: call_optional(client, "terminal_info"),
+            )
+            account = self._mt5_call(
+                "TEST_TRADE_ACCOUNT_INFO",
+                lambda: call_optional(client, "account_info"),
+            )
+            self._validate_test_environment(client, terminal, account)
+        except Exception as exc:
+            self._record_failure(self._last_stage or "startup", str(exc))
+            raise
         if account is None or not is_demo_account(client, account):
             LOGGER.error("TEST_TRADE_FAILED reason=test_trade is allowed only on an MT5 demo account")
             print("test_trade is allowed only on an MT5 demo account", flush=True)
             raise ExecutionError("test_trade is allowed only on an MT5 demo account")
-        LOGGER.info("DEMO_ACCOUNT_CONFIRMED")
+        LOGGER.info(
+            "DEMO_ACCOUNT_CONFIRMED trade_mode=%s login=%s server=%s",
+            get_value(account, "trade_mode"),
+            get_value(account, "login"),
+            get_value(account, "server"),
+        )
+        self._set_stage("DEMO_ACCOUNT_CONFIRMED", "validating")
 
-        symbol_name = resolve_symbol_name(client, self.settings.test_symbol)
-        select_symbol(client, symbol_name)
-        symbol_info = require_symbol_info(client, symbol_name)
-        tick = require_tick(client, symbol_name)
+        self._set_stage("TEST_TRADE_SYMBOL_RESOLUTION_STARTED", "resolving_symbol")
+        symbol_name, symbol_info = self._resolve_test_symbol(client)
+        self._set_stage("TEST_TRADE_SYMBOL_RESOLVED", "resolving_symbol", symbol=symbol_name)
+        self._set_stage("TEST_TRADE_SYMBOL_SELECT_STARTED", "validating", symbol=symbol_name)
+        self._mt5_call(
+            "TEST_TRADE_SYMBOL_SELECT_STARTED",
+            lambda: select_symbol(client, symbol_name),
+        )
+        self._set_stage("TEST_TRADE_SYMBOL_SELECTED", "validating", symbol=symbol_name)
+        self._set_stage("TEST_TRADE_TICK_REQUEST_STARTED", "validating", symbol=symbol_name)
+        tick = self._mt5_call(
+            "TEST_TRADE_TICK_REQUEST_STARTED",
+            lambda: require_tick(client, symbol_name),
+        )
         price = select_tick_price(tick, "buy")
-        conversion_rate = currency_to_eur_rate(client, quote_currency(symbol_info, symbol_name))
+        LOGGER.info(
+            "TEST_TRADE_TICK_RECEIVED symbol=%s bid=%s ask=%s last=%s",
+            symbol_name,
+            get_value(tick, "bid"),
+            get_value(tick, "ask"),
+            get_value(tick, "last"),
+        )
+        self._set_stage("TEST_TRADE_TICK_RECEIVED", "validating", symbol=symbol_name)
+        self._set_stage("TEST_TRADE_VOLUME_CALCULATION_STARTED", "validating", symbol=symbol_name)
+        conversion_rate = self._mt5_call(
+            "TEST_TRADE_CURRENCY_CONVERSION",
+            lambda: currency_to_eur_rate(client, quote_currency(symbol_info, symbol_name)),
+        )
         volume_calc = calculate_volume_for_eur_notional(
             requested_eur_notional=self.settings.test_notional_eur,
             price=price,
@@ -593,6 +853,16 @@ class TestTradeManager:
             volume_max=volume_max(symbol_info),
             volume_step=volume_step(symbol_info),
         )
+        LOGGER.info(
+            "TEST_TRADE_VOLUME_CALCULATED symbol=%s requested_eur=%s volume=%s "
+            "estimated_eur=%s per_lot_eur=%s",
+            symbol_name,
+            volume_calc.requested_eur_notional,
+            volume_calc.volume,
+            volume_calc.estimated_actual_exposure_eur,
+            volume_calc.per_lot_exposure_eur,
+        )
+        self._set_stage("TEST_TRADE_VOLUME_CALCULATED", "validating", symbol=symbol_name)
         plan_id = deterministic_plan_id(
             Path("test_trade"),
             0,
@@ -602,6 +872,7 @@ class TestTradeManager:
                 "entry_time_local": datetime.now(timezone.utc).isoformat(),
             },
         )
+        self._plan_id = plan_id
         comment = executor.order_comment(plan_id, test=True)
         self.ledger.upsert_pending(
             {
@@ -631,69 +902,613 @@ class TestTradeManager:
             filling_mode=choose_filling_mode(client, symbol_info),
             deviation=executor.settings.max_deviation_points,
         )
-        check_result = client.order_check(request) if hasattr(client, "order_check") else None
-        if check_result is not None and not is_success_retcode(
-            client,
-            check_result,
-            include_check_success=True,
-        ):
-            raise ExecutionError(f"test_trade order_check failed: {describe_mt5_result(client, check_result)}")
-        open_result = send_order(client, request)
-        if not is_success_retcode(client, open_result):
-            raise ExecutionError(f"test_trade order_send failed: {describe_mt5_result(client, open_result)}")
-        position_ticket = reconcile_position_ticket(
+        self._set_stage("TEST_TRADE_ORDER_CHECK_STARTED", "opening", symbol=symbol_name)
+        self._set_stage("TEST_TRADE_ORDER_SEND_STARTED", "opening", symbol=symbol_name)
+        request, check_result, open_result = self._send_request_with_filling_fallback(
+            client=client,
+            request=request,
+            symbol_info=symbol_info,
+            request_log_stage="TEST_TRADE_ORDER_REQUEST",
+            check_log_stage="TEST_TRADE_ORDER_CHECK_RESULT",
+            send_log_stage="TEST_TRADE_ORDER_SEND_RESULT",
+        )
+        self._set_stage("TEST_POSITION_OPEN_VERIFICATION_STARTED", "opening", symbol=symbol_name)
+        position = self._verify_position_open(
             client,
             symbol_name=symbol_name,
-            magic=self.settings.test_magic,
             plan_id=plan_id,
             order_result=open_result,
+        )
+        position_ticket = _ticket_text(get_value(position, "ticket"))
+        self._position_ticket = position_ticket
+        actual_volume = _numeric(get_value(position, "volume")) or volume_calc.volume
+        opening_price = (
+            _numeric(get_value(position, "price_open"))
+            or _numeric(get_result_value(open_result, "price"))
+            or price
         )
         self.ledger.mark_opened(
             plan_id,
             status="opened",
-            actual_volume=volume_calc.volume,
-            opening_price=_numeric(get_result_value(open_result, "price")) or price,
+            actual_volume=actual_volume,
+            opening_price=opening_price,
             order_ticket=_ticket_text(get_result_value(open_result, "order")),
             deal_ticket=_ticket_text(get_result_value(open_result, "deal")),
             position_ticket=position_ticket,
             requested_volume=volume_calc.volume,
             estimated_actual_exposure=volume_calc.estimated_actual_exposure_eur,
         )
+        opened = True
         LOGGER.info(
-            "TEST_POSITION_OPENED symbol=%s position=%s volume=%s price=%s",
+            "TEST_POSITION_OPENED symbol=%s order=%s deal=%s position=%s volume=%s price=%s",
             symbol_name,
+            get_result_value(open_result, "order"),
+            get_result_value(open_result, "deal"),
             position_ticket,
-            volume_calc.volume,
-            price,
+            actual_volume,
+            opening_price,
         )
         print("test trade opened successfully", flush=True)
         try:
+            self._set_stage("TEST_TRADE_HOLD_STARTED", "open_and_waiting", symbol=symbol_name)
             _sleep_without_busy_wait(self.settings.test_hold_seconds)
+            self._set_stage("TEST_TRADE_HOLD_COMPLETED", "open_and_waiting", symbol=symbol_name)
         finally:
-            LOGGER.info("TEST_CLOSE_STARTED symbol=%s position=%s", symbol_name, position_ticket)
-            close_position_by_ticket(
+            close_outcome = self._close_verified_test_position(
                 client=client,
                 symbol_name=symbol_name,
                 position_ticket=position_ticket,
                 magic=self.settings.test_magic,
                 comment=comment,
-                deviation=executor.settings.max_deviation_points,
             )
+            opened = False
             self.ledger.mark_closed(
                 plan_id,
-                closing_price=None,
-                closing_deal=None,
+                closing_price=close_outcome.price,
+                closing_deal=close_outcome.deal_ticket,
                 closing_reason="test_trade_complete",
             )
-        LOGGER.info("TEST_POSITION_CLOSED symbol=%s position=%s", symbol_name, position_ticket)
+        self._set_stage("TEST_TRADE_HISTORY_RECONCILED", "closing", symbol=symbol_name)
+        self._reconcile_history(client, position_ticket=position_ticket, plan_id=plan_id)
+        self._set_stage("TEST_TRADE_COMPLETED", "completed", symbol=symbol_name)
         print("test trade closed successfully", flush=True)
         return ExecutionOutcome(
             plan_id=plan_id,
             symbol=symbol_name,
             status="closed",
             message="test trade opened and closed successfully",
+            order_ticket=_ticket_text(get_result_value(open_result, "order")),
+            deal_ticket=_ticket_text(get_result_value(open_result, "deal")),
+            position_ticket=position_ticket,
+            actual_volume=actual_volume,
+            price=opening_price,
+        )
+
+    def _validate_test_environment(self, client: Any, terminal: Any, account: Any) -> None:
+        if account is None or not is_demo_account(client, account):
+            LOGGER.error(
+                "TEST_TRADE_FAILED stage=TEST_TRADE_ACCOUNT_CHECK_STARTED "
+                "reason=test_trade is allowed only on an MT5 demo account"
+            )
+            print("test_trade is allowed only on an MT5 demo account", flush=True)
+            raise ExecutionError("test_trade is allowed only on an MT5 demo account")
+        if terminal is not None:
+            if get_value(terminal, "connected") is False:
+                raise ExecutionError("MT5 terminal is not connected.")
+            if get_value(terminal, "trade_allowed") is False:
+                raise ExecutionError("MT5 terminal trading is disabled.")
+        if get_value(account, "trade_allowed") is False:
+            raise ExecutionError("MT5 account trading is disabled.")
+        if get_value(account, "trade_expert") is False:
+            raise ExecutionError("MT5 expert/API trading is disabled.")
+
+    def _send_request_with_filling_fallback(
+        self,
+        *,
+        client: Any,
+        request: dict[str, Any],
+        symbol_info: Any,
+        request_log_stage: str,
+        check_log_stage: str,
+        send_log_stage: str,
+    ) -> tuple[dict[str, Any], Any | None, Any]:
+        """Try supported filling modes until MT5 accepts one or fails definitively."""
+
+        last_result: Any | None = None
+        last_check: Any | None = None
+        for filling_mode in candidate_filling_modes(client, symbol_info, request.get("type_filling")):
+            attempt = dict(request)
+            attempt["type_filling"] = filling_mode
+            LOGGER.info("%s %s", request_log_stage, safe_request_log(attempt))
+            check_result = None
+            if hasattr(client, "order_check"):
+                check_result = self._mt5_call(
+                    check_log_stage,
+                    lambda attempt=attempt: client.order_check(attempt),
+                )
+            last_check = check_result
+            LOGGER.info(
+                "%s %s",
+                check_log_stage,
+                describe_mt5_result(client, check_result)
+                if check_result is not None
+                else "not_supported",
+            )
+            if check_result is not None and not is_success_retcode(
+                client,
+                check_result,
+                include_check_success=True,
+            ):
+                if is_unsupported_filling_retcode(client, check_result):
+                    continue
+                raise ExecutionError(
+                    f"test_trade order_check failed: {describe_mt5_result(client, check_result)}"
+                )
+            result = self._mt5_call(
+                send_log_stage,
+                lambda attempt=attempt: send_order(client, attempt),
+            )
+            last_result = result
+            LOGGER.info("%s %s", send_log_stage, describe_mt5_result(client, result))
+            if is_success_retcode(client, result):
+                return attempt, check_result, result
+            if is_unsupported_filling_retcode(client, result):
+                continue
+            raise ExecutionError(
+                f"test_trade order_send failed: {describe_mt5_result(client, result)}"
+            )
+        raise ExecutionError(
+            "test_trade order_send failed for all filling modes: "
+            f"{describe_mt5_result(client, last_result or last_check)}"
+        )
+
+    def _resolve_test_symbol(self, client: Any) -> tuple[str, Any]:
+        exact_candidates = []
+        for candidate in [self.settings.test_symbol, "BTCUSD", "BTCEUR", "GBTC"]:
+            if candidate not in exact_candidates:
+                exact_candidates.append(candidate)
+        oversized: list[str] = []
+        for candidate in exact_candidates:
+            try:
+                info = self._mt5_call(
+                    f"TEST_TRADE_SYMBOL_INFO_{candidate}",
+                    lambda candidate=candidate: require_symbol_info(client, candidate),
+                    timeout_seconds=10,
+                )
+                min_exposure = self._candidate_min_exposure_eur(client, candidate, info)
+            except Exception as exc:
+                LOGGER.info(
+                    "TEST_TRADE_SYMBOL_CANDIDATE_SKIPPED name=%s reason=%s",
+                    candidate,
+                    exc,
+                )
+                continue
+            LOGGER.info(
+                "TEST_TRADE_SYMBOL_CANDIDATE name=%s match=exact description=%s "
+                "trade_mode=%s contract_size=%s volume_min=%s volume_max=%s "
+                "volume_step=%s currency_base=%s currency_profit=%s "
+                "minimum_exposure_eur=%.2f",
+                candidate,
+                get_value(info, "description"),
+                get_value(info, "trade_mode"),
+                get_value(info, "trade_contract_size"),
+                get_value(info, "volume_min"),
+                get_value(info, "volume_max"),
+                get_value(info, "volume_step"),
+                get_value(info, "currency_base"),
+                get_value(info, "currency_profit"),
+                min_exposure,
+            )
+            if min_exposure <= self.settings.test_notional_eur:
+                LOGGER.info(
+                    "TEST_TRADE_SYMBOL_RESOLVED symbol=%s reason=min_exposure_within_cap",
+                    candidate,
+                )
+                return candidate, info
+            oversized.append(f"{candidate}=EUR {min_exposure:.2f}")
+
+        symbols = self._mt5_call(
+            "TEST_TRADE_SYMBOL_RESOLUTION_STARTED",
+            lambda: symbols_get(client),
+        )
+        requested_key = normalize_symbol_name(self.settings.test_symbol)
+        selected: tuple[int, str] | None = None
+        for symbol in symbols:
+            name = str(get_value(symbol, "name") or "").strip()
+            if not name:
+                continue
+            name_key = normalize_symbol_name(name)
+            score = 0
+            if name == self.settings.test_symbol:
+                score = 100
+            elif name_key == requested_key:
+                score = 95
+            elif name_key.startswith(requested_key):
+                score = 90
+            elif "BTCUSD" in name_key:
+                score = 85
+            if score <= 0:
+                continue
+            LOGGER.info(
+                "TEST_TRADE_SYMBOL_CANDIDATE name=%s score=%s match=name",
+                name,
+                score,
+            )
+            if selected is None or score > selected[0]:
+                selected = (score, name)
+            if score >= 95:
+                break
+        if selected is None:
+            for symbol in symbols:
+                name = str(get_value(symbol, "name") or "").strip()
+                if not name:
+                    continue
+                description = str(get_value(symbol, "description") or get_value(symbol, "path") or "")
+                combined_key = normalize_symbol_name(f"{name} {description}")
+                if not (
+                    ("BTC" in combined_key or "BITCOIN" in combined_key)
+                    and ("USD" in combined_key or "DOLLAR" in combined_key)
+                ):
+                    continue
+                LOGGER.info(
+                    "TEST_TRADE_SYMBOL_CANDIDATE name=%s score=70 match=description description=%s",
+                    name,
+                    description,
+                )
+                selected = (70, name)
+                break
+        if selected is None:
+            raise ExecutionError(
+                "No suitable BTCUSD/Bitcoin USD symbol found in MT5. "
+                f"Oversized exact candidates: {', '.join(oversized)}"
+            )
+        symbol_name = selected[1]
+        info = self._mt5_call(
+            "TEST_TRADE_SYMBOL_INFO",
+            lambda: require_symbol_info(client, symbol_name),
+        )
+        min_exposure = self._candidate_min_exposure_eur(client, symbol_name, info)
+        if min_exposure > self.settings.test_notional_eur:
+            raise ExecutionError(
+                f"Selected Bitcoin symbol {symbol_name} minimum exposure "
+                f"EUR {min_exposure:.2f} exceeds requested EUR "
+                f"{self.settings.test_notional_eur:.2f}."
+            )
+        LOGGER.info(
+            "TEST_TRADE_SYMBOL_RESOLVED symbol=%s description=%s trade_mode=%s "
+            "contract_size=%s min=%s max=%s step=%s digits=%s point=%s "
+            "currency_base=%s currency_profit=%s",
+            symbol_name,
+            get_value(info, "description"),
+            get_value(info, "trade_mode"),
+            get_value(info, "trade_contract_size"),
+            get_value(info, "volume_min"),
+            get_value(info, "volume_max"),
+            get_value(info, "volume_step"),
+            get_value(info, "digits"),
+            get_value(info, "point"),
+            get_value(info, "currency_base"),
+            get_value(info, "currency_profit"),
+        )
+        return symbol_name, info
+
+    def _candidate_min_exposure_eur(self, client: Any, symbol_name: str, info: Any) -> float:
+        select_symbol(client, symbol_name)
+        tick = require_tick(client, symbol_name)
+        price = select_tick_price(tick, "buy")
+        conversion_rate = currency_to_eur_rate(client, quote_currency(info, symbol_name))
+        return price * contract_size(info) * volume_min(info) * conversion_rate
+
+    def _verify_position_open(
+        self,
+        client: Any,
+        *,
+        symbol_name: str,
+        plan_id: str,
+        order_result: Any,
+    ) -> Any:
+        deadline = monotonic() + TEST_TRADE_OPEN_VERIFY_SECONDS
+        candidate_tickets = {
+            _ticket_text(get_result_value(order_result, key))
+            for key in ("position", "order", "deal")
+        }
+        candidate_tickets.discard(None)
+        while monotonic() < deadline:
+            position = self._find_test_position(
+                client,
+                symbol_name=symbol_name,
+                plan_id=plan_id,
+                candidate_tickets=candidate_tickets,
+            )
+            if position is not None:
+                return position
+            threading.Event().wait(0.5)
+        raise ExecutionError("Opened order was not visible in MT5 positions_get().")
+
+    def _find_test_position(
+        self,
+        client: Any,
+        *,
+        symbol_name: str,
+        plan_id: str,
+        candidate_tickets: set[str | None] | None = None,
+    ) -> Any | None:
+        positions = self._mt5_call(
+            "TEST_POSITION_QUERY",
+            lambda: positions_get(client, symbol=symbol_name),
+            timeout_seconds=10,
+        )
+        for position in positions:
+            ticket = _ticket_text(get_value(position, "ticket"))
+            magic = int(_numeric(get_value(position, "magic")) or -1)
+            comment = str(get_value(position, "comment") or "")
+            if candidate_tickets and ticket in candidate_tickets:
+                return position
+            if magic == self.settings.test_magic and plan_id[:16] in comment:
+                return position
+            if magic == self.settings.test_magic and not plan_id:
+                return position
+        return None
+
+    def _close_verified_test_position(
+        self,
+        *,
+        client: Any,
+        symbol_name: str,
+        position_ticket: str | None,
+        magic: int,
+        comment: str,
+    ) -> ExecutionOutcome:
+        self._set_stage("TEST_TRADE_CLOSE_STARTED", "closing", symbol=symbol_name)
+        position = find_position_for_plan(
+            client,
+            symbol_name=symbol_name,
+            magic=magic,
+            plan_id="",
             position_ticket=position_ticket,
         )
+        if position is None:
+            raise ExecutionError(f"Test position {position_ticket} is not open.")
+        side = "sell" if position_direction(client, position) == "buy" else "buy"
+        tick = self._mt5_call(
+            "TEST_TRADE_CLOSE_TICK_REQUEST",
+            lambda: require_tick(client, symbol_name),
+        )
+        price = select_tick_price(tick, side)
+        symbol_info = self._mt5_call(
+            "TEST_TRADE_CLOSE_SYMBOL_INFO",
+            lambda: require_symbol_info(client, symbol_name),
+        )
+        request = build_close_request(
+            client=client,
+            symbol=symbol_name,
+            side=side,
+            volume=_numeric(get_value(position, "volume")) or 0.0,
+            price=price,
+            position_ticket=position_ticket or _ticket_text(get_value(position, "ticket")),
+            magic=magic,
+            comment=comment,
+            filling_mode=choose_filling_mode(client, symbol_info),
+            deviation=self.settings.max_deviation_points,
+        )
+        request, close_check, close_result = self._send_request_with_filling_fallback(
+            client=client,
+            request=request,
+            symbol_info=symbol_info,
+            request_log_stage="TEST_TRADE_CLOSE_REQUEST",
+            check_log_stage="TEST_TRADE_CLOSE_ORDER_CHECK_RESULT",
+            send_log_stage="TEST_TRADE_CLOSE_ORDER_SEND_RESULT",
+        )
+        self._set_stage("TEST_POSITION_CLOSE_VERIFICATION_STARTED", "closing", symbol=symbol_name)
+        self._verify_position_closed(
+            client,
+            symbol_name=symbol_name,
+            position_ticket=position_ticket,
+        )
+        LOGGER.info(
+            "TEST_POSITION_CLOSED symbol=%s order=%s deal=%s position=%s price=%s",
+            symbol_name,
+            get_result_value(close_result, "order"),
+            get_result_value(close_result, "deal"),
+            position_ticket,
+            get_result_value(close_result, "price"),
+        )
+        return ExecutionOutcome(
+            plan_id=self._plan_id or "",
+            symbol=symbol_name,
+            status="closed",
+            message=describe_mt5_result(client, close_result),
+            order_ticket=_ticket_text(get_result_value(close_result, "order")),
+            deal_ticket=_ticket_text(get_result_value(close_result, "deal")),
+            position_ticket=position_ticket,
+            price=_numeric(get_result_value(close_result, "price")) or price,
+        )
+
+    def _verify_position_closed(
+        self,
+        client: Any,
+        *,
+        symbol_name: str,
+        position_ticket: str | None,
+    ) -> None:
+        deadline = monotonic() + TEST_TRADE_CLOSE_VERIFY_SECONDS
+        while monotonic() < deadline:
+            positions = self._mt5_call(
+                "TEST_POSITION_CLOSE_QUERY",
+                lambda: positions_get(client, symbol=symbol_name),
+                timeout_seconds=10,
+            )
+            still_open = [
+                position
+                for position in positions
+                if int(_numeric(get_value(position, "magic")) or -1) == self.settings.test_magic
+                and (
+                    not position_ticket
+                    or _ticket_text(get_value(position, "ticket")) == position_ticket
+                )
+            ]
+            if not still_open:
+                return
+            threading.Event().wait(0.5)
+        raise ExecutionError(f"Test position {position_ticket} remained open after close.")
+
+    def _reconcile_history(self, client: Any, *, position_ticket: str | None, plan_id: str) -> None:
+        if not hasattr(client, "history_deals_get"):
+            LOGGER.info("TEST_TRADE_HISTORY_RECONCILED history_deals_get=not_supported")
+            return
+
+        matching: list[Any] = []
+        if position_ticket:
+            try:
+                deals = self._mt5_call(
+                    "TEST_TRADE_HISTORY_RECONCILE_POSITION",
+                    lambda: client.history_deals_get(position=int(position_ticket)),
+                    timeout_seconds=20,
+                )
+                matching.extend(list(deals or []))
+            except Exception as exc:
+                LOGGER.warning(
+                    "TEST_TRADE_HISTORY_POSITION_QUERY_FAILED position=%s reason=%s",
+                    position_ticket,
+                    exc,
+                )
+
+        if not matching:
+            start = datetime.now(timezone.utc) - timedelta(hours=2)
+            end = datetime.now(timezone.utc) + timedelta(minutes=1)
+            try:
+                deals = self._mt5_call(
+                    "TEST_TRADE_HISTORY_RECONCILE_RANGE",
+                    lambda: client.history_deals_get(start, end),
+                    timeout_seconds=20,
+                )
+            except Exception as exc:
+                LOGGER.warning("TEST_TRADE_HISTORY_RANGE_QUERY_FAILED reason=%s", exc)
+                deals = []
+            for deal in list(deals or []):
+                comment = str(get_value(deal, "comment") or "")
+                magic = int(_numeric(get_value(deal, "magic")) or -1)
+                position_id = _ticket_text(get_value(deal, "position_id"))
+                if (
+                    magic == self.settings.test_magic
+                    or plan_id[:16] in comment
+                    or position_id == position_ticket
+                ):
+                    matching.append(deal)
+
+        unique_matching = []
+        seen_tickets: set[str] = set()
+        for deal in matching:
+            ticket = _ticket_text(get_value(deal, "ticket")) or repr(deal)
+            if ticket in seen_tickets:
+                continue
+            seen_tickets.add(ticket)
+            unique_matching.append(deal)
+
+        profit = sum(_numeric(get_value(deal, "profit")) or 0.0 for deal in unique_matching)
+        commission = sum(_numeric(get_value(deal, "commission")) or 0.0 for deal in unique_matching)
+        swap = sum(_numeric(get_value(deal, "swap")) or 0.0 for deal in unique_matching)
+        if unique_matching:
+            self.ledger.update(
+                plan_id,
+                realised_profit_loss=profit,
+                commission=commission,
+                swap=swap,
+            )
+        for deal in unique_matching:
+            comment = str(get_value(deal, "comment") or "")
+            LOGGER.info(
+                "TEST_TRADE_HISTORY_DEAL ticket=%s order=%s position=%s entry=%s "
+                "type=%s volume=%s price=%s profit=%s comment=%s",
+                get_value(deal, "ticket"),
+                get_value(deal, "order"),
+                get_value(deal, "position_id"),
+                get_value(deal, "entry"),
+                get_value(deal, "type"),
+                get_value(deal, "volume"),
+                get_value(deal, "price"),
+                get_value(deal, "profit"),
+                comment,
+            )
+        LOGGER.info(
+            "TEST_TRADE_HISTORY_RECONCILED matching_deals=%s position=%s profit=%s",
+            len(unique_matching),
+            position_ticket,
+            profit,
+        )
+
+    def _mt5_call(
+        self,
+        stage: str,
+        func: Any,
+        timeout_seconds: int | None = None,
+    ) -> Any:
+        return call_with_timeout(
+            stage,
+            func,
+            timeout_seconds=timeout_seconds or TEST_TRADE_OPERATION_TIMEOUT_SECONDS,
+        )
+
+    def _set_stage(self, stage: str, state: str, **extra: Any) -> None:
+        with self._lock:
+            self._state = state
+            self._last_stage = stage
+            if state != "failed":
+                self._failure_reason = ""
+            self._write_status_locked(extra)
+        LOGGER.info("%s%s", stage, _format_stage_extra(extra))
+
+    def _record_failure(self, stage: str, reason: str) -> None:
+        if self._plan_id:
+            try:
+                self.ledger.mark_failed(self._plan_id, reason)
+            except Exception:
+                LOGGER.exception("TEST_TRADE_LEDGER_FAILURE_MARK_FAILED plan_id=%s", self._plan_id)
+        with self._lock:
+            self._state = "failed"
+            self._last_stage = stage
+            self._failure_reason = reason
+            self._write_status_locked()
+        LOGGER.error("TEST_TRADE_FAILED stage=%s reason=%s", stage, reason)
+
+    def _write_status_locked(self, extra: dict[str, Any] | None = None) -> None:
+        self.status_store.write(
+            state=self._state,
+            last_stage=self._last_stage,
+            failure_reason=self._failure_reason,
+            worker_alive=bool(self._worker and self._worker.is_alive()),
+            started_at=self._started_at.isoformat() if self._started_at else None,
+            plan_id=self._plan_id,
+            position_ticket=self._position_ticket,
+            **(extra or {}),
+        )
+
+    def _is_active_locked(self) -> bool:
+        return bool(self._active and self._worker is not None and self._worker.is_alive())
+
+    def _repair_stale_state_locked(self) -> None:
+        if self._active and (self._worker is None or not self._worker.is_alive()):
+            self._active = False
+            if self._state not in {"completed", "failed"}:
+                self._state = "failed"
+                self._failure_reason = "stale active state without live worker"
+            self._write_status_locked()
+            LOGGER.info("TEST_TRADE_STATE_CLEARED reason=stale_worker")
+            return
+        if not self._active or self._started_at is None:
+            return
+        max_seconds = self.settings.test_hold_seconds + TEST_TRADE_WATCHDOG_EXTRA_SECONDS
+        age = (datetime.now(timezone.utc) - self._started_at).total_seconds()
+        if age > max_seconds:
+            self._active = False
+            self._state = "failed"
+            self._failure_reason = f"watchdog timeout after {age:.0f}s"
+            self._write_status_locked()
+            LOGGER.error(
+                "TEST_TRADE_FAILED stage=%s reason=watchdog_timeout age=%.0fs",
+                self._last_stage,
+                age,
+            )
 
 
 def execute_trade_plan_file_safely(trade_plan_path: Path) -> list[ExecutionOutcome]:
@@ -741,7 +1556,7 @@ def start_test_trade_safely(manager: TestTradeManager | None = None) -> bool:
         print("test_trade is already running", flush=True)
         LOGGER.info("TEST_TRADE_FAILED reason=already_running")
     else:
-        print("test_trade started; it will close automatically after the hold time.", flush=True)
+        print("test_trade started; follow the log for execution details", flush=True)
     return started
 
 
@@ -752,6 +1567,12 @@ def default_test_trade_manager() -> TestTradeManager:
     if _DEFAULT_TEST_TRADE_MANAGER is None:
         _DEFAULT_TEST_TRADE_MANAGER = TestTradeManager()
     return _DEFAULT_TEST_TRADE_MANAGER
+
+
+def test_trade_status() -> dict[str, Any]:
+    """Return the current process-wide test-trade status."""
+
+    return default_test_trade_manager().status()
 
 
 def recover_stale_test_trades_safely() -> None:
@@ -782,6 +1603,50 @@ def recover_stale_test_trades_safely() -> None:
             )
     except Exception as exc:
         LOGGER.info("TEST_TRADE_RECOVERY skipped: %s", exc)
+
+
+def call_with_timeout(
+    stage: str,
+    func: Any,
+    timeout_seconds: int = TEST_TRADE_OPERATION_TIMEOUT_SECONDS,
+) -> Any:
+    """Run one operation with a bounded wait and propagate/log failures."""
+
+    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def runner() -> None:
+        try:
+            result_queue.put((True, func()))
+        except BaseException as exc:  # noqa: BLE001 - preserve worker exception.
+            result_queue.put((False, exc))
+
+    thread = threading.Thread(target=runner, name=f"{stage}-timeout", daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise OperationTimeoutError(
+            f"{stage} timed out after {timeout_seconds} seconds."
+        )
+    ok, value = result_queue.get()
+    if ok:
+        return value
+    raise value
+
+
+def safe_request_log(request: dict[str, Any]) -> dict[str, Any]:
+    """Return an order request copy safe for logs."""
+
+    return {
+        key: value
+        for key, value in request.items()
+        if key.lower() not in {"password", "login", "server"}
+    }
+
+
+def _format_stage_extra(extra: dict[str, Any]) -> str:
+    if not extra:
+        return ""
+    return " " + " ".join(f"{key}={value}" for key, value in extra.items())
 
 
 def load_trade_plan_orders(trade_plan_path: Path) -> list[TradePlanOrder]:
@@ -1031,6 +1896,7 @@ def close_position_by_ticket(
         return ExecutionOutcome("", symbol_name, "closed", "position already closed")
     side = "sell" if position_direction(client, position) == "buy" else "buy"
     price = select_tick_price(require_tick(client, symbol_name), side)
+    symbol_info = require_symbol_info(client, symbol_name)
     request = build_close_request(
         client=client,
         symbol=symbol_name,
@@ -1040,11 +1906,27 @@ def close_position_by_ticket(
         position_ticket=position_ticket or _ticket_text(get_value(position, "ticket")),
         magic=magic,
         comment=comment,
-        filling_mode=choose_filling_mode(client, require_symbol_info(client, symbol_name)),
+        filling_mode=choose_filling_mode(client, symbol_info),
         deviation=deviation,
     )
-    result = send_order(client, request)
-    if not is_success_retcode(client, result):
+    result = None
+    for filling_mode in candidate_filling_modes(client, symbol_info, request.get("type_filling")):
+        attempt = dict(request)
+        attempt["type_filling"] = filling_mode
+        result = send_order(client, attempt)
+        if is_success_retcode(client, result):
+            request = attempt
+            break
+        if is_unsupported_filling_retcode(client, result):
+            LOGGER.info(
+                "RECOVERY_CLOSE_FILLING_RETRY symbol=%s position=%s type_filling=%s",
+                symbol_name,
+                position_ticket,
+                filling_mode,
+            )
+            continue
+        raise ExecutionError(f"close failed: {describe_mt5_result(client, result)}")
+    if result is None or not is_success_retcode(client, result):
         raise ExecutionError(f"close failed: {describe_mt5_result(client, result)}")
     return ExecutionOutcome(
         plan_id="",
@@ -1072,6 +1954,41 @@ def choose_filling_mode(client: Any, symbol_info: Any) -> int:
     return order_return
 
 
+def candidate_filling_modes(
+    client: Any,
+    symbol_info: Any,
+    preferred: Any | None = None,
+) -> list[int]:
+    """Return unique filling modes to try, starting with the preferred mode."""
+
+    modes = [
+        int(preferred) if preferred is not None else choose_filling_mode(client, symbol_info),
+        mt5_constant(client, "ORDER_FILLING_FOK", 0),
+        mt5_constant(client, "ORDER_FILLING_IOC", 1),
+        mt5_constant(client, "ORDER_FILLING_RETURN", 2),
+    ]
+    result: list[int] = []
+    for mode in modes:
+        if mode not in result:
+            result.append(mode)
+    return result
+
+
+def is_unsupported_filling_retcode(client: Any, result: Any) -> bool:
+    """Return True when MT5 says the chosen filling mode is unsupported."""
+
+    retcode = get_result_value(result, "retcode")
+    try:
+        numeric = int(retcode)
+    except (TypeError, ValueError):
+        return False
+    unsupported = {
+        10030,
+        mt5_constant(client, "TRADE_RETCODE_INVALID_FILL", 10030),
+    }
+    return numeric in unsupported
+
+
 def currency_to_eur_rate(client: Any, currency: str) -> float:
     """Return the current conversion rate from a currency into EUR."""
 
@@ -1083,6 +2000,13 @@ def currency_to_eur_rate(client: Any, currency: str) -> float:
 
     direct = f"{normalized}EUR"
     inverse = f"EUR{normalized}"
+    direct_rate = _conversion_rate_from_exact_symbol(client, direct, inverse=False)
+    if direct_rate is not None:
+        return direct_rate
+    inverse_rate = _conversion_rate_from_exact_symbol(client, inverse, inverse=True)
+    if inverse_rate is not None:
+        return inverse_rate
+
     symbols = {normalize_symbol_name(get_value(item, "name")): get_value(item, "name") for item in symbols_get(client)}
     if normalize_symbol_name(direct) in symbols:
         symbol_name = str(symbols[normalize_symbol_name(direct)])
@@ -1096,6 +2020,31 @@ def currency_to_eur_rate(client: Any, currency: str) -> float:
             raise ExecutionError(f"Invalid conversion rate for {symbol_name}.")
         return 1.0 / rate
     raise ExecutionError(f"No reliable MT5 conversion symbol for {normalized}->EUR.")
+
+
+def _conversion_rate_from_exact_symbol(
+    client: Any,
+    symbol_name: str,
+    inverse: bool,
+) -> float | None:
+    """Try an exact conversion symbol without scanning the whole broker list."""
+
+    if not hasattr(client, "symbol_info"):
+        return None
+    try:
+        info = client.symbol_info(symbol_name)
+    except Exception:
+        return None
+    if info is None:
+        return None
+    try:
+        select_symbol(client, symbol_name)
+        rate = select_tick_price(require_tick(client, symbol_name), None)
+    except Exception:
+        return None
+    if rate <= 0:
+        return None
+    return 1.0 / rate if inverse else rate
 
 
 def resolve_symbol_name(client: Any, requested_symbol: str) -> str:

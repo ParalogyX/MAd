@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from mt5_execution import (
     ExecutionSettings,
     MT5TradeExecutor,
     TestTradeManager as MT5TestTradeManager,
+    TestTradeStatusStore as MT5TestTradeStatusStore,
     build_market_order_request,
     calculate_volume_for_eur_notional,
     currency_to_eur_rate,
@@ -36,10 +38,18 @@ class FakeMT5Client:
     ACCOUNT_TRADE_MODE_REAL = 0
     ACCOUNT_TRADE_MODE_DEMO = 1
 
-    def __init__(self, *, demo: bool = True, check_retcode: int = 0, send_retcode: int = 10009):
+    def __init__(
+        self,
+        *,
+        demo: bool = True,
+        check_retcode: int = 0,
+        send_retcode: int = 10009,
+        unsupported_fill_modes: set[int] | None = None,
+    ):
         self.demo = demo
         self.check_retcode = check_retcode
         self.send_retcode = send_retcode
+        self.unsupported_fill_modes = unsupported_fill_modes or set()
         self.positions: list[SimpleNamespace] = []
         self.sent_requests: list[dict] = []
         self.next_ticket = 1000
@@ -89,6 +99,8 @@ class FakeMT5Client:
 
     def order_send(self, request):
         self.sent_requests.append(dict(request))
+        if request.get("type_filling") in self.unsupported_fill_modes:
+            return SimpleNamespace(retcode=10030, comment="Unsupported filling mode")
         if self.send_retcode != self.TRADE_RETCODE_DONE:
             return SimpleNamespace(retcode=self.send_retcode, comment="rejected")
 
@@ -272,6 +284,34 @@ def test_execute_trade_plan_success_duplicate_prevention_and_close(tmp_path):
     assert any("position" in request for request in fake_client.sent_requests)
 
 
+def test_strategy_execution_retries_unsupported_filling_mode(tmp_path):
+    path = tmp_path / "trade_plan_unit_2026-06-12_09-05.csv"
+    write_trade_plan(path)
+    fake_client = FakeMT5Client(unsupported_fill_modes={FakeMT5Client.ORDER_FILLING_IOC})
+    executor = MT5TradeExecutor(
+        settings=ExecutionSettings(target_notional_eur=1000, allow_live_trading=False),
+        ledger=ExecutionLedger(tmp_path / "retry.sqlite3"),
+        client_factory=lambda: fake_client,
+    )
+
+    open_outcome = executor.execute_trade_plan_file(path)
+    close_outcome = executor.close_trade_plan_file(path)
+
+    open_requests = [request for request in fake_client.sent_requests if "position" not in request]
+    close_requests = [request for request in fake_client.sent_requests if "position" in request]
+    assert open_outcome[0].status == "opened"
+    assert close_outcome[0].status == "closed"
+    assert [request["type_filling"] for request in open_requests[:2]] == [
+        FakeMT5Client.ORDER_FILLING_IOC,
+        FakeMT5Client.ORDER_FILLING_FOK,
+    ]
+    assert [request["type_filling"] for request in close_requests[:2]] == [
+        FakeMT5Client.ORDER_FILLING_IOC,
+        FakeMT5Client.ORDER_FILLING_FOK,
+    ]
+    assert len(fake_client.positions) == 0
+
+
 def test_failed_order_check_and_live_account_refusal(tmp_path):
     path = tmp_path / "trade_plan_unit_2026-06-12_09-05.csv"
     write_trade_plan(path)
@@ -367,6 +407,7 @@ def test_test_trade_demo_sequence_and_second_command_rejection(tmp_path):
         settings=ExecutionSettings(test_hold_seconds=0, test_notional_eur=50),
         ledger=ExecutionLedger(tmp_path / "test.sqlite3"),
         client_factory=lambda: fake_client,
+        status_store=MT5TestTradeStatusStore(tmp_path / "test_status.json"),
     )
 
     outcome = manager.run_blocking()
@@ -375,7 +416,42 @@ def test_test_trade_demo_sequence_and_second_command_rejection(tmp_path):
     assert len(fake_client.positions) == 0
 
     manager._active = True
+    manager._worker = None
+    assert manager.start() is True
+    assert manager._worker is not None
+    manager._worker.join(timeout=5)
+
+
+def test_test_trade_rejects_live_worker(tmp_path):
+    manager = MT5TestTradeManager(
+        settings=ExecutionSettings(test_hold_seconds=0, test_notional_eur=50),
+        ledger=ExecutionLedger(tmp_path / "test.sqlite3"),
+        client_factory=lambda: FakeMT5Client(),
+        status_store=MT5TestTradeStatusStore(tmp_path / "test_status.json"),
+    )
+    manager._active = True
+    manager._worker = threading.current_thread()
+
     assert manager.start() is False
+
+
+def test_test_trade_retries_unsupported_filling_mode(tmp_path):
+    fake_client = FakeMT5Client(unsupported_fill_modes={FakeMT5Client.ORDER_FILLING_IOC})
+    manager = MT5TestTradeManager(
+        settings=ExecutionSettings(test_hold_seconds=0, test_notional_eur=50),
+        ledger=ExecutionLedger(tmp_path / "test.sqlite3"),
+        client_factory=lambda: fake_client,
+        status_store=MT5TestTradeStatusStore(tmp_path / "test_status.json"),
+    )
+
+    outcome = manager.run_blocking()
+
+    open_requests = [request for request in fake_client.sent_requests if "position" not in request]
+    assert outcome.status == "closed"
+    assert [request["type_filling"] for request in open_requests[:2]] == [
+        FakeMT5Client.ORDER_FILLING_IOC,
+        FakeMT5Client.ORDER_FILLING_FOK,
+    ]
 
 
 def test_deterministic_plan_id_is_stable(tmp_path):
